@@ -6,8 +6,12 @@ from classifier.redactor import Redactor
 
 fitz.TOOLS.mupdf_display_errors(False)
 
+
 class FileExtractor:
-    def __init__(self, max_chars=1000):
+    PDF_PAGES_TO_SCAN = 3
+    DOCX_PARAGRAPHS_TO_SCAN = 30
+
+    def __init__(self, max_chars: int = 1000):
         self.max_chars = max_chars
 
     def extract_text(self, filepath: str) -> str:
@@ -15,22 +19,27 @@ class FileExtractor:
         text = ""
         try:
             if ext == '.pdf':
-                doc = fitz.open(filepath)
-                if len(doc) > 0:
-                    # Wrap in str() to prevent Pylance "list[Unknown]" type checking errors
-                    text = str(doc[0].get_text())
+                with fitz.open(filepath) as doc:
+                    pages = []
+                    for i, page in enumerate(doc):
+                        if i >= self.PDF_PAGES_TO_SCAN:
+                            break
+                        pages.append(str(page.get_text()))
+                        if sum(len(p) for p in pages) >= self.max_chars:
+                            break
+                    text = "\n".join(pages)
             elif ext == '.docx':
                 doc = docx.Document(filepath)
-                text = "\n".join([p.text for p in doc.paragraphs[:10]])
-            elif ext in ['.csv']:
+                paras = [p.text for p in doc.paragraphs[:self.DOCX_PARAGRAPHS_TO_SCAN] if p.text.strip()]
+                text = "\n".join(paras)
+            elif ext == '.csv':
                 df = pd.read_csv(filepath, nrows=5)
-                text = f"Columns: {', '.join(df.columns)}\nData:\n{df.head(2).to_string()}"
-            elif ext in ['.txt', '.log', '.json', '.xml']:
+                text = f"Columns: {', '.join(map(str, df.columns))}\nData:\n{df.head(2).to_string()}"
+            elif ext in ('.txt', '.log', '.json', '.xml', '.md', '.html', '.eml'):
                 with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                    text = f.read(self.max_chars)
+                    text = f.read(self.max_chars * 2)
         except Exception:
-            return "" # Fail silently on extraction errors to keep workflow moving
-        
-        # The type checker now knows 'text' is 100% a string
+            return ""
+
         raw_text = text[:self.max_chars].strip()
         return Redactor.redact(raw_text)
