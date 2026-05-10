@@ -1,12 +1,34 @@
+"""Filename-rules classification engine.
+
+Two entry points:
+
+* ``high_confidence_match`` — unambiguous filename markers (IMM forms,
+  T4, EVL, ``PR_`` prefix, ...). Returns ``Classification`` at confidence
+  100, or ``None``.
+* ``classify`` — system/hidden file detection, then keyword matches against
+  the tokenised filename, then an extension-only fallback for archives
+  and installers. Returns a ``Classification``.
+
+The tokeniser splits on underscores, dashes, dots, parentheses, whitespace
+*and* camelCase boundaries so ``IMM5476e``, ``previewFormPCCDetail.pdf``,
+and ``MSUBARODA_WESEducationalCredentialsForwarding.pdf`` all surface their
+intended tokens.
+"""
+from __future__ import annotations
+
 import os
 import re
+from typing import Optional
+
 import yaml
 
+from classifier.types import UNKNOWN_CATEGORY, Classification
 
-# (regex, category, reason). Patterns are searched against a tokenized,
-# space-separated, lowercased version of the filename so `\b` works reliably
+
+# (regex, category, reason). Patterns are searched against a tokenised,
+# space-separated, lowercased version of the filename so ``\b`` works
 # regardless of underscores, dashes, or camelCase in the original name.
-HIGH_CONFIDENCE_PATTERNS = [
+HIGH_CONFIDENCE_PATTERNS: list[tuple[str, str, str]] = [
     (r'\bimm\d{4,}\w*', 'Canadian_PR_Docs', "IMM form number in filename"),
     (r'\bircc\b', 'Canadian_PR_Docs', "IRCC marker in filename"),
     (r'\bielts\b', 'Canadian_PR_Docs', "IELTS marker in filename"),
@@ -28,18 +50,20 @@ HIGH_CONFIDENCE_PATTERNS = [
 
 
 class RulesEngine:
+    HC_METHOD = "Rules (HC)"
+    KEYWORD_METHOD = "Rules"
+
     def __init__(self, config_path: str):
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-        self.categories = self.config['categories']
+        self.categories: dict = self.config['categories']
 
     @staticmethod
     def _tokenize(filename: str) -> tuple[list[str], str]:
-        # Split camelCase: aB -> a B, and ABCd -> AB Cd.
+        # Split camelCase: aB -> a B, then ABCd -> AB Cd.
         s = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', filename)
         s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', s)
-        # Collapse any non-alphanumeric run (underscores, dashes, dots, parens,
-        # commas, whitespace, etc.) into a single space.
+        # Collapse any non-alphanumeric run into a single space.
         s = re.sub(r'[^A-Za-z0-9]+', ' ', s)
         tokens = [t.lower() for t in s.split() if t]
         return tokens, ' '.join(tokens)
@@ -53,48 +77,64 @@ class RulesEngine:
             return kw in flat
         if kw in tokens:
             return True
-        # Allow simple suffix tolerance for longer keywords (e.g., "doctor" -> "doctors")
+        # Allow simple suffix tolerance for longer keywords (e.g. doctor -> doctors).
         if len(kw) >= 5:
             return any(t.startswith(kw) for t in tokens)
         return False
 
-    def high_confidence_match(self, filepath: str):
-        """Return (category, 100, reason) for unambiguous filename markers, else None."""
+    # ------------------------------------------------------------------ public
+
+    def high_confidence_match(self, filepath: str) -> Optional[Classification]:
+        """Return a Classification for unambiguous filename markers, else None."""
         filename = os.path.basename(filepath)
         _, flat = self._tokenize(filename)
         for pattern, cat, reason in HIGH_CONFIDENCE_PATTERNS:
             if re.search(pattern, flat):
-                return cat, 100, reason
+                return Classification(category=cat, confidence=100, method=self.HC_METHOD, reason=reason)
         return None
 
-    def classify(self, filepath: str) -> tuple[str, int, str]:
+    def classify(self, filepath: str) -> Classification:
+        """Classify by system extension, keyword, or archive fallback."""
         filename = os.path.basename(filepath)
         ext = os.path.splitext(filename)[1].lower()
 
-        # 1. System/hidden files
+        # 1. System / hidden files
         meta_exts = self.categories.get('Metadata_System', {}).get('extensions', [])
         if ext in meta_exts or filename.startswith('.'):
-            return "Metadata_System", 100, "System/Hidden file detected by extension"
+            return Classification(
+                category="Metadata_System",
+                confidence=100,
+                method=self.KEYWORD_METHOD,
+                reason="System/Hidden file detected by extension",
+            )
 
-        # 2. Tokenized filename keyword match. Multi-word phrases are checked
-        #    before single-word keywords so the more specific signal wins
-        #    (e.g. "air india" beats a generic "ticket").
+        # 2. Tokenised keyword match. Multi-word phrases first so the more
+        #    specific signal wins (e.g. "air india" beats a generic "ticket").
         tokens, flat = self._tokenize(filename)
         for phrase_pass in (True, False):
             for cat, data in self.categories.items():
                 if ext and ext not in data.get('extensions', []):
                     continue
                 for keyword in data.get('keywords', []):
-                    is_phrase = ' ' in keyword.strip()
+                    is_phrase = ' ' in str(keyword).strip()
                     if is_phrase != phrase_pass:
                         continue
                     if self._keyword_matches(keyword, tokens, flat):
-                        return cat, 95, f"Matched '{keyword}' in filename"
+                        return Classification(
+                            category=cat,
+                            confidence=95,
+                            method=self.KEYWORD_METHOD,
+                            reason=f"Matched '{keyword}' in filename",
+                        )
 
-        # 3. Extension-only fallback for archives/installers so generic
-        #    .zip / .dmg / .pkg files don't end up in Unknown.
+        # 3. Extension-only fallback for archives / installers
         archives_exts = self.categories.get('Archives_and_Apps', {}).get('extensions', [])
         if ext in archives_exts:
-            return "Archives_and_Apps", 75, f"Archive/installer fallback by extension '{ext}'"
+            return Classification(
+                category="Archives_and_Apps",
+                confidence=75,
+                method=self.KEYWORD_METHOD,
+                reason=f"Archive/installer fallback by extension '{ext}'",
+            )
 
-        return "Unknown_Unsorted", 0, "No rule matched"
+        return Classification.unknown(reason="No rule matched", method=self.KEYWORD_METHOD)
