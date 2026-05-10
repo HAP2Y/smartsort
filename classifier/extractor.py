@@ -1,5 +1,8 @@
 import os
-import fitz  # PyMuPDF
+try:
+    import pymupdf as fitz  # PyMuPDF 1.24+ (canonical module name)
+except ImportError:  # pragma: no cover - legacy install
+    import fitz  # PyMuPDF < 1.24
 import docx
 import pandas as pd
 from classifier.redactor import Redactor

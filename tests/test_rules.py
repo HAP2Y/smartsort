@@ -26,10 +26,9 @@ def rules():
 def _classify(rules, name):
     hc = rules.high_confidence_match(name)
     if hc:
-        cat, conf, reason = hc
-        return cat, conf, reason, "HC"
-    cat, conf, reason = rules.classify(name)
-    return cat, conf, reason, "Rules"
+        return hc.category, hc.confidence, hc.reason, "HC"
+    c = rules.classify(name)
+    return c.category, c.confidence, c.reason, "Rules"
 
 
 CANADIAN_PR_CASES = [
