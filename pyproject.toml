@@ -56,6 +56,13 @@ packages = ["classifier", "movers"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
+filterwarnings = [
+    # PyMuPDF's SWIG bindings emit DeprecationWarnings on Python 3.12+ that
+    # the user can't act on. Silence the specific messages without hiding
+    # warnings from our own code.
+    "ignore:builtin type Swig.* has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 110
