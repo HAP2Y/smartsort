@@ -48,74 +48,10 @@ Without an editable install you can still invoke the script directly: `python ma
 
 Each `--apply` writes a `.smartsort_undo.json` log into the target directory; `undo` reads that log, restores files to their original paths, and removes the empty category folders left behind. Files already nested inside a SmartSort category folder are skipped on subsequent runs, so re-running is safe and idempotent.
 
-## Customise it for yourself
-
-The default categories are tuned for the original author's life (Canadian PR docs, Guidewire work, an astro-quant project). Forking and rewiring it for your own setup is a 5–10 minute job, almost entirely in `config/categories.yaml`.
-
-### 1. Fork and clone
-
-```bash
-git clone https://github.com/<your-fork>/smartsort.git
-cd smartsort
-pip install -e ".[dev]"
-```
-
-### 2. Reshape `config/categories.yaml`
-
-The whole engine is driven by this one file. Each top-level entry under `categories:` is a folder name, a list of file extensions the category accepts, and a list of keywords / phrases. The file ends with a `settings:` block that controls thresholds and the AI model.
-
-```yaml
-categories:
-  Work_Acme:                            # folder name (created on --apply)
-    extensions: [.pdf, .docx, .pptx]    # only files with these extensions can match
-    keywords:
-      - acme                            # single token, exact match (case-insensitive)
-      - "client onboarding"             # multi-word phrase: matched as adjacent tokens
-      - jira
-
-  Family_Photos:
-    extensions: [.jpg, .jpeg, .png, .heic, .mp4]
-    keywords: [family, kids, vacation, "school play"]
-
-  # ...and so on. Add as many categories as you like.
-
-  Unknown_Unsorted:                     # MUST exist — this is the catch-all
-    extensions: []
-    keywords: []
-
-settings:
-  confidence_threshold: 80              # AI answers below this fall through to keyword rules
-  max_extract_chars: 1000               # upper bound on extracted text per file
-  default_local_model: qwen2.5:32b      # any model you've pulled with `ollama pull`
-```
-
-**How matching actually works** (worth knowing before editing):
-- The filename is first split on underscores, dashes, dots, parentheses, whitespace, and camelCase boundaries — so `MyFile_Acme-2026.pdf` becomes the tokens `[my, file, acme, 2026, pdf]`.
-- **Single-word keywords** match a token exactly. Keywords ≥ 5 characters also match prefixes (`doctor` → `doctors`).
-- **Multi-word keywords** (anything with a space) match as an adjacent phrase against the joined tokens (`"client onboarding"` matches `Client_Onboarding_Acme.pdf`).
-- **Multi-word phrases beat single-word matches**, so `"air india"` will win over a generic `ticket` keyword, regardless of order in the YAML.
-- Extensions are filters, not matches — a file is only considered for a category if its extension is in that category's `extensions` list.
-
-### 3. Add unambiguous filename markers (high-confidence rules)
-
-If you have filenames where one substring is a dead giveaway — invoice numbers, project codes, employer prefixes — add a regex to `HIGH_CONFIDENCE_PATTERNS` in `classifier/rules.py`. These match against the tokenised filename, return confidence 100, and short-circuit both AI and keyword rules.
-
-```python
-HIGH_CONFIDENCE_PATTERNS = [
-    # ...existing patterns...
-    (r'\binv\d{4,}\b',     'Financial_Taxes', "Invoice number"),
-    (r'^acme\b',           'Work_Acme',       "Filename prefix 'ACME_'"),
-    (r'\bproject zenith\b','Work_Acme',       "Project Zenith doc"),
-]
-```
-
-Use `\b` word boundaries; patterns are anchored to the tokenised, lowercased filename (spaces between tokens). Run `pytest tests/test_rules.py -k <your_keyword>` after adding patterns to lock them in with a regression test.
-
-### 4. Tune the AI prompt (optional)
-
 `classifier/ai_local.py` contains a `PROMPT_TEMPLATE` with disambiguation rules ("EVL letters → PR docs, not Career"). When you change the category set, edit those rules so the LLM understands your taxonomy. Each rule should explain *why* a category is what it is, plus what it explicitly **isn't**, so the model has tie-breakers.
 
 ### 5. Adjust redaction (optional)
+`config/categories.yaml` controls categories, allowed extensions, keyword lists, and engine settings:
 
 `classifier/redactor.py` strips emails, phone numbers, URLs, JWTs, and AWS keys from extracted text before it reaches the LLM. Add patterns there if you want to redact extra entities (medical record numbers, internal employee IDs, etc.) before any text leaves the machine.
 
