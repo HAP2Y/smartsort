@@ -48,19 +48,31 @@ Without an editable install you can still invoke the script directly: `python ma
 
 Each `--apply` writes a `.smartsort_undo.json` log into the target directory; `undo` reads that log, restores files to their original paths, and removes the empty category folders left behind. Files already nested inside a SmartSort category folder are skipped on subsequent runs, so re-running is safe and idempotent.
 
-## Configuration
+`classifier/ai_local.py` contains a `PROMPT_TEMPLATE` with disambiguation rules ("EVL letters → PR docs, not Career"). When you change the category set, edit those rules so the LLM understands your taxonomy. Each rule should explain *why* a category is what it is, plus what it explicitly **isn't**, so the model has tie-breakers.
 
+### 5. Adjust redaction (optional)
 `config/categories.yaml` controls categories, allowed extensions, keyword lists, and engine settings:
+
+`classifier/redactor.py` strips emails, phone numbers, URLs, JWTs, and AWS keys from extracted text before it reaches the LLM. Add patterns there if you want to redact extra entities (medical record numbers, internal employee IDs, etc.) before any text leaves the machine.
+
+### 6. Verify
+
+```bash
+smartsort check-rules                   # validates YAML, lists categories + counts
+smartsort run ~/Downloads --no-ai       # rules-only dry-run
+smartsort run ~/Downloads -vv           # debug logs (which classifier picked what)
+python -m pytest tests/ -q              # full test suite
+```
+
+Then write a couple of regression tests in `tests/test_rules.py` for the filenames you care most about — five minutes of test-writing now will save you debugging when you tweak rules later.
+
+## Settings reference
 
 | Setting | Purpose |
 | --- | --- |
-| `confidence_threshold` | Minimum AI confidence (0–100) before AI's answer is accepted. Below this, falls through to keyword rules. |
-| `max_extract_chars` | Upper bound on characters extracted per file before sending to the LLM. |
-| `default_local_model` | Ollama model tag (e.g. `qwen2.5:32b`). |
-
-Add a new category by appending to `categories:` with `extensions:` and `keywords:` lists. Multi-word keywords like `"employment verification"` are matched as adjacent-token phrases.
-
-For unambiguous filename markers, add a regex to `HIGH_CONFIDENCE_PATTERNS` in `classifier/rules.py` — these win over both AI and keyword matches.
+| `confidence_threshold` | Minimum AI confidence (0–100) before AI's answer is accepted. Below this, the file falls through to the keyword rules. |
+| `max_extract_chars` | Upper bound on characters extracted per file before sending to the LLM. Lower = faster, less context for the model. |
+| `default_local_model` | Ollama model tag (e.g. `qwen2.5:32b`, `llama3.1:8b`). Must be pulled locally. |
 
 ## Project layout
 
