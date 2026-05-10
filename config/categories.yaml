@@ -1,48 +1,185 @@
 categories:
   Canadian_PR_Docs:
     extensions: [.pdf, .docx, .jpg, .png]
-    keywords: [ircc, "express entry", ita, ielts, wes, visa, pr, "work permit", "study permit", immigration, eca, noc, lmia, pcc, imm5476e, imm5787, imm5790, imm5791, imm5786, imm10003]
-  
+    keywords:
+      - ircc
+      - "express entry"
+      - ita
+      - ielts
+      - wes
+      - visa
+      - pr
+      - "work permit"
+      - "study permit"
+      - immigration
+      - eca
+      - noc
+      - lmia
+      - pcc
+      - t4
+      - "employment verification"
+      - "police clearance"
+      - "permanent resident"
+      - imm5476e
+      - imm5787
+      - imm5790
+      - imm5791
+      - imm5786
+      - imm10003
+      - imm5644e
+
   AstroQuant_Sidereal:
     extensions: [.csv, .xlsx, .json, .py, .ipynb, .txt, .tar.gz]
-    keywords: [astro, quant, backtest, trading, stocks, nifty, banknifty, ephemeris, planet, sidereal, strategy, ohlc, signals, candles, market, finance]
-  
+    keywords:
+      - astro
+      - quant
+      - backtest
+      - trading
+      - stocks
+      - nifty
+      - banknifty
+      - nfty
+      - ephemeris
+      - planet
+      - sidereal
+      - strategy
+      - ohlc
+      - signals
+      - candles
+      - market
+      - finance
+      - xlb
+      - xlc
+      - xle
+      - xlf
+      - xli
+      - xlk
+      - xlp
+      - xlre
+      - xlu
+      - xlv
+      - xly
+
   Guidewire_PSE_Work:
-    extensions: [.txt, .log, .xml, .json, .csv, .pdf, .docx, .pptx]
-    keywords: [guidewire, gw, jira, salesforce, sfdc, claimcenter, policycenter, billingcenter, support, production, uat, ticket, bug, defect, stacktrace, logs, okta, zurichci, liberty-corp, uplift, "flex work"]
-  
+    extensions: [.txt, .log, .xml, .json, .csv, .pdf, .docx, .pptx, .md]
+    keywords:
+      - guidewire
+      - gw
+      - jira
+      - salesforce
+      - sfdc
+      - claimcenter
+      - policycenter
+      - billingcenter
+      - support
+      - production
+      - uat
+      - ticket
+      - bug
+      - defect
+      - stacktrace
+      - logs
+      - okta
+      - zurichci
+      - liberty-corp
+      - uplift
+      - "flex work"
+      - jutro
+      - aviva
+
   Resumes_Career_Tech:
     extensions: [.pdf, .docx, .pptx]
-    keywords: [resume, cv, offer, interview, job, career, linkedin, "cover letter", certification, employment, verification, portfolio, "software engineer", developer, sde, ckad]
-  
+    keywords:
+      - resume
+      - cv
+      - offer
+      - interview
+      - "cover letter"
+      - certification
+      - portfolio
+      - "software engineer"
+      - developer
+      - sde
+      - ckad
+      - linkedin
+
   Financial_Taxes:
     extensions: [.pdf, .csv]
-    keywords: [hdfc, acct, statement, bank, emi, receipt, "pay slip", t4, tax, balancecertificate, billedstatements, bill, voucher, invoice]
-  
+    keywords:
+      - hdfc
+      - acct
+      - statement
+      - bank
+      - emi
+      - receipt
+      - "pay slip"
+      - "balance certificate"
+      - balancecertificate
+      - billedstatements
+      - bill
+      - voucher
+      - invoice
+      - "credit card"
+      - jio
+
   Medical_Health:
     extensions: [.pdf, .docx, .jpg, .eml]
-    keywords: [medical, doctor, health, clinic, hospital, prescription, note, submission, hives, ulticaria]
-  
+    keywords:
+      - medical
+      - doctor
+      - health
+      - clinic
+      - hospital
+      - prescription
+      - hives
+      - ulticaria
+      - urticaria
+      - "follow up"
+
   Travel_Transit:
     extensions: [.pdf, .jpg, .png]
-    keywords: [indigo, "air india", itinerary, ticket, flight, booking, travel, boarding]
-  
+    keywords:
+      - indigo
+      - "air india"
+      - itinerary
+      - ticket
+      - flight
+      - boarding
+      - "boarding pass"
+      - hotel
+      - reservation
+      - octave
+
   Franchise_Business_Research:
     extensions: [.pdf, .docx, .html, .zip]
-    keywords: [franchise, research, framework, business, venture, "reality flip"]
-  
+    keywords:
+      - franchise
+      - "reality flip"
+      - "market evaluation"
+      - "facility report"
+      - "due diligence"
+
   Media_Images:
     extensions: [.jpg, .jpeg, .png, .gif, .mp4, .mov]
-    keywords: [screenshot, image, photo, pxl, img]
+    keywords:
+      - screenshot
+      - image
+      - photo
+      - pxl
+      - img
 
   Archives_and_Apps:
     extensions: [.zip, .tar, .gz, .dmg, .pkg, .exe]
-    keywords: [installer, app, setup]
+    keywords:
+      - installer
+      - app
+      - setup
 
   Metadata_System:
     extensions: [.ds_store, .tmp, .cache, .log, .localized, .cer]
-    keywords: [error, gitignore]
-  
+    keywords:
+      - gitignore
+
   Unknown_Unsorted:
     extensions: []
     keywords: []

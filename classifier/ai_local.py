@@ -32,19 +32,23 @@ class LocalAIClassifier:
 
     def classify(self, filename: str, snippet: str, categories: list) -> tuple[str, int, str]:
         prompt = f"""
-        You are a highly intelligent document classification AI. Classify the provided file into EXACTLY ONE of the following categories:
+        You are a document classification AI. Classify the file into EXACTLY ONE category:
         {', '.join(categories)}
-        
+
         Filename: {filename}
         Extracted Text Snippet: {snippet}
-        
-        CRITICAL CONTEXT & RULES:
-        1. Resumes_Career_Tech vs Guidewire_PSE_Work: Any resume, CV, or document highlighting AI automation, Kubernetes, or Software Development Engineering skills belongs in Resumes_Career_Tech. Guidewire_PSE_Work is strictly for internal operational logs, platform support tickets, flex work agreements, and system specs.
-        2. Canadian_PR_Docs vs Career: Standard employment verification letters (even if they mention Canadian or Indian offices) belong in Resumes_Career_Tech unless they are explicitly an IRCC immigration form (like an IMM form, Express Entry profile, or ITA).
-        3. Prioritize text content over file names.
-        
+
+        DISAMBIGUATION RULES (apply in order):
+        1. Canadian_PR_Docs is the bucket for everything the user is collecting for a Canadian Permanent Residence application. This INCLUDES: employment verification letters (any employer, any country, including Guidewire), reference letters used as PR proof, T4 slips and pay slips when used as proof-of-employment, IMM forms, IRCC paperwork, IELTS / WES / ECA results, NOC references, LMIA, PCC (Police Clearance Certificates), ITA, retainer agreements with immigration consultants, and Express Entry profiles.
+        2. Resumes_Career_Tech is ONLY for actual resumes / CVs (career-summary documents listing the person's own skills and experience), cover letters, certifications, interview prep, and portfolios. It is NOT for employment verification letters, even if they describe a role.
+        3. Guidewire_PSE_Work is strictly for internal Guidewire operational artifacts: JIRA tickets, support cases, stack traces, logs, platform/system specs, customer SAML metadata, internal policies, and EA / provisioning emails. It is NOT for the user's own employment verification letters or T4s, even when the employer is Guidewire — those go to Canadian_PR_Docs.
+        4. Financial_Taxes covers personal banking, credit-card statements, EMI, receipts, invoices, vouchers, and utility bills. T4s and pay slips submitted as PR proof go to Canadian_PR_Docs (rule 1) instead.
+        5. Travel_Transit is for itineraries, boarding passes, e-tickets, and hotel reservations only. Business / market-research reports about a location are NOT travel.
+        6. Use the filename as a strong tie-breaker, especially prefixes like 'PR_', 'Canada_', or form codes like IMM####, T4, PCC, NOC.
+        7. If the snippet is mostly redacted or generic and you cannot confidently classify, return Unknown_Unsorted with a confidence below 80.
+
         Return ONLY valid JSON in this exact format, with no markdown formatting or backticks:
-        {{"category": "Category_Name", "confidence": 95, "reason": "brief explanation based on text content"}}
+        {{"category": "Category_Name", "confidence": 95, "reason": "brief explanation grounded in the text content"}}
         """
 
         payload = {
