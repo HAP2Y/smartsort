@@ -1,0 +1,53 @@
+categories:
+  Canadian_PR_Docs:
+    extensions: [.pdf, .docx, .jpg, .png]
+    keywords: [ircc, "express entry", ita, ielts, wes, visa, pr, "work permit", "study permit", immigration, eca, noc, lmia, pcc, imm5476e, imm5787, imm5790, imm5791, imm5786, imm10003]
+  
+  AstroQuant_Sidereal:
+    extensions: [.csv, .xlsx, .json, .py, .ipynb, .txt, .tar.gz]
+    keywords: [astro, quant, backtest, trading, stocks, nifty, banknifty, ephemeris, planet, sidereal, strategy, ohlc, signals, candles, market, finance]
+  
+  Guidewire_PSE_Work:
+    extensions: [.txt, .log, .xml, .json, .csv, .pdf, .docx, .pptx]
+    keywords: [guidewire, gw, jira, salesforce, sfdc, claimcenter, policycenter, billingcenter, support, production, uat, ticket, bug, defect, stacktrace, logs, okta, zurichci, liberty-corp, uplift, "flex work"]
+  
+  Resumes_Career_Tech:
+    extensions: [.pdf, .docx, .pptx]
+    keywords: [resume, cv, offer, interview, job, career, linkedin, "cover letter", certification, employment, verification, portfolio, "software engineer", developer, sde, ckad]
+  
+  Financial_Taxes:
+    extensions: [.pdf, .csv]
+    keywords: [hdfc, acct, statement, bank, emi, receipt, "pay slip", t4, tax, balancecertificate, billedstatements, bill, voucher, invoice]
+  
+  Medical_Health:
+    extensions: [.pdf, .docx, .jpg, .eml]
+    keywords: [medical, doctor, health, clinic, hospital, prescription, note, submission, hives, ulticaria]
+  
+  Travel_Transit:
+    extensions: [.pdf, .jpg, .png]
+    keywords: [indigo, "air india", itinerary, ticket, flight, booking, travel, boarding]
+  
+  Franchise_Business_Research:
+    extensions: [.pdf, .docx, .html, .zip]
+    keywords: [franchise, research, framework, business, venture, "reality flip"]
+  
+  Media_Images:
+    extensions: [.jpg, .jpeg, .png, .gif, .mp4, .mov]
+    keywords: [screenshot, image, photo, pxl, img]
+
+  Archives_and_Apps:
+    extensions: [.zip, .tar, .gz, .dmg, .pkg, .exe]
+    keywords: [installer, app, setup]
+
+  Metadata_System:
+    extensions: [.ds_store, .tmp, .cache, .log, .localized, .cer]
+    keywords: [error, gitignore]
+  
+  Unknown_Unsorted:
+    extensions: []
+    keywords: []
+
+settings:
+  confidence_threshold: 80
+  max_extract_chars: 1000
+  default_local_model: "qwen2.5:32b"

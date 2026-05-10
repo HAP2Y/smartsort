@@ -1,0 +1,61 @@
+# =========================
+# Operating System Files
+# =========================
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# =========================
+# IDEs and Editors
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# Environment Variables & Secrets
+# =========================
+.env
+.env.local
+.env.*
+*.pem
+secrets.json
+
+# =========================
+# Python
+# =========================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+.venv/
+ENV/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# =========================
+# Go
+# =========================
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
