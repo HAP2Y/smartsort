@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -21,7 +22,10 @@ from classifier.types import UNKNOWN_CATEGORY, Classification
 
 log = logging.getLogger(__name__)
 
-DEFAULT_OLLAMA_URL = "http://localhost:11434"
+# Ollama lives on the host's network in single-process runs but on
+# `host.docker.internal` (or a sibling container) when workers run under
+# Docker. Honour OLLAMA_HOST so the same code works in both shapes.
+DEFAULT_OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_TIMEOUT = 60
 DEFAULT_HEALTH_TIMEOUT = 3
 METHOD = "Local AI"

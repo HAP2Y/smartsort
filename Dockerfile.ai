@@ -1,0 +1,34 @@
+# Image for AI workers (ai-small / ai-large). Adds PyMuPDF + python-docx
+# for text extraction on top of the slim base. The Ollama model itself
+# does NOT live in this container — workers talk to Ollama on the host
+# (via OLLAMA_HOST), so the image stays under ~250 MB.
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt pyproject.toml ./
+
+RUN pip install --no-cache-dir \
+        "typer>=0.12.3" \
+        "rich>=13.7.1" \
+        "PyYAML>=6.0.1" \
+        "requests>=2.31.0" \
+        "redis>=5.0.0" \
+        "PyMuPDF>=1.24.2" \
+        "python-docx>=1.1.2"
+
+COPY classifier ./classifier
+COPY inference ./inference
+COPY movers ./movers
+COPY config ./config
+COPY main.py ./main.py
+
+ENV PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python", "main.py"]
+CMD ["--help"]

@@ -238,16 +238,25 @@ def _run_local(*, files: list[Path], config: dict, no_ai: bool) -> dict[str, Cla
 # --------------------------------------------------- compose lifecycle
 
 
-# Per-route scale tuning. files_per_worker is the "soft saturation" point —
-# above it we add another worker. max_workers caps the autoscaler so a
-# directory of 10k files doesn't try to spawn 400 containers.
+# Per-route scale tuning.
+#
+# `files_per_worker` is the soft saturation point — above it we add another
+# worker. `max_workers` caps the autoscaler so a directory of 10k files
+# doesn't try to spawn 400 containers.
+#
+# AI route caps are deliberately conservative. The throughput bottleneck on
+# AI routes is the single host Ollama instance, not the Python worker — once
+# Ollama is saturated, extra workers just queue on it while burning memory
+# (each container is ~150 MB, and the Ollama-side serialisation means
+# replicas past 2-3 give zero throughput gain on a single GPU / CPU). If you
+# point workers at a multi-instance Ollama setup, raise these caps.
 #
 # rules-worker subscribes to both `rules` and `ocr`, so its scaling target
 # combines the two route counts.
 COMPOSE_SCALE = {
     "rules-worker":    {"files_per_worker": 100, "max_workers": 2},
-    "ai-small-worker": {"files_per_worker": 25,  "max_workers": 6},
-    "ai-large-worker": {"files_per_worker": 10,  "max_workers": 3},
+    "ai-small-worker": {"files_per_worker": 50,  "max_workers": 2},
+    "ai-large-worker": {"files_per_worker": 20,  "max_workers": 1},
 }
 
 
@@ -551,6 +560,28 @@ def serve_worker(
     # routes on one worker, name the AI route first so the LLM is wired up.
     classifier = _build_worker_classifier(route_list[0], config, model)
     worker = Worker(name=worker_name, routes=route_list, classifier=classifier, backend=qb)
+
+    # AI routes silently failing on Ollama connectivity is the single most
+    # common operator footgun (e.g. forgetting OLLAMA_HOST inside a
+    # container). Probe once at boot and shout into the log so the user
+    # sees the problem in seconds, not after the orchestrator times out.
+    primary = route_list[0]
+    if primary in (ROUTE_AI_SMALL, ROUTE_AI_LARGE):
+        from classifier.ai_local import DEFAULT_OLLAMA_URL, LocalAIClassifier
+        model_tag = model or (
+            config["settings"].get("large_model", config["settings"]["default_local_model"])
+            if primary == ROUTE_AI_LARGE
+            else config["settings"]["default_local_model"]
+        )
+        ai = LocalAIClassifier(model=model_tag)
+        ok, msg = ai.is_running()
+        status_colour = "green" if ok else "red"
+        console.print(f"[{status_colour}]Ollama @ {DEFAULT_OLLAMA_URL} → {msg}[/{status_colour}]")
+        if not ok:
+            console.print(
+                "[yellow]Worker will keep running and falling back to rules, "
+                "but AI classification is disabled until Ollama is reachable.[/yellow]"
+            )
 
     console.print(
         f"[green]Worker {worker_name} listening on {route_list} via {backend}.[/green]"

@@ -134,10 +134,44 @@ This:
 | Service | Files per worker | Max replicas |
 | --- | --- | --- |
 | `rules-worker` (also drains `ocr`) | 100 | 2 |
-| `ai-small-worker` | 25 | 6 |
-| `ai-large-worker` | 10 | 3 |
+| `ai-small-worker` | 50 | 2 |
+| `ai-large-worker` | 20 | 1 |
 
 The table lives in `main.py:COMPOSE_SCALE` — change the numbers to match your hardware.
+
+> **Why the AI caps are low.** A single Ollama instance serialises LLM calls (one model in memory, one inference at a time). Past 2–3 workers per AI route you only add memory pressure, never throughput. If you point workers at a multi-instance Ollama setup (e.g. a GPU pod pool in Kubernetes), raise the caps to match.
+
+### Memory footprint
+
+The full Compose fleet is intentionally lean:
+
+| Component | RSS (steady state) | Notes |
+| --- | --- | --- |
+| `redis` | ~30 MB | capped at 128 MB |
+| `rules-worker` | ~80 MB | slim image — no PyMuPDF, no python-docx, no pandas (`Dockerfile`) |
+| `ai-small-worker` ×2 | ~150 MB each | text-extraction image (`Dockerfile.ai`), capped at 768 MB |
+| `ai-large-worker` ×1 | ~150 MB | same image as ai-small |
+| **Inside Docker** | **~610 MB** | |
+| Ollama on host (qwen2.5:14b) | ~9 GB | model lives in Ollama, not in any worker container |
+| Ollama on host (+ qwen2.5:32b) | +~20 GB | only loaded if you actually use the `ai-large` route with the 32B model |
+
+Tactics used to keep this small:
+
+- **Two-image build.** `Dockerfile` is the slim base used by the rules worker (typer + rich + pyyaml + requests + redis — pure-Python wheels). `Dockerfile.ai` adds PyMuPDF + python-docx only for the workers that actually call them. ~150 MB lighter rules image.
+- **No `pandas` / `numpy`.** CSV preview uses stdlib `csv` — pandas was 125 MB of dependency for "show me the columns and the first two rows".
+- **No `litellm`.** Was in `requirements.txt` from an earlier scaffold; never used in code.
+- **Lazy backend imports.** PyMuPDF and python-docx are imported only when the file actually needs them, so the rules-worker can run on the slim image without them installed.
+- **Per-service `mem_limit`.** `docker-compose.yml` declares hard ceilings, so a misbehaving worker can't eat the host.
+- **Conservative AI replica caps.** See the table above — replicas past 2 on a single Ollama instance burn memory for zero throughput gain.
+
+If you're memory-constrained, prefer a smaller model:
+
+```bash
+ollama pull qwen2.5:7b      # ~5 GB
+ollama pull qwen2.5:3b      # ~2 GB
+```
+
+…and set `default_local_model: qwen2.5:7b` in `config/categories.yaml`.
 
 ### Manual lifecycle
 
@@ -241,8 +275,9 @@ classifier/                # reference workload (file classification)
 
 movers/organizer.py        # idempotent moves + undo log
 config/categories.yaml
-Dockerfile
-docker-compose.yml         # redis + per-route worker pools + on-demand cli
+Dockerfile                 # slim base image used by the rules-worker
+Dockerfile.ai              # adds PyMuPDF + python-docx for AI workers
+docker-compose.yml         # redis + per-route worker pools (with mem_limit)
 main.py                    # run, undo, check-rules, serve-worker
 tests/                     # 157 tests, all offline
 ```

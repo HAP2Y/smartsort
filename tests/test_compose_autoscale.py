@@ -90,7 +90,11 @@ def test_rules_worker_scale_combines_rules_and_ocr_counts():
 
 def test_scale_targets_uses_workload_specific_replica_counts(tmp_path):
     """A real example: 92 ai-small jobs, 6 ai-large, 26 rules, 10 ocr —
-    the exact split from the user's debugging run."""
+    the exact split from the user's debugging run.
+
+    AI route caps are deliberately conservative because Ollama is the
+    single-instance bottleneck (see `COMPOSE_SCALE` doc-string in main.py).
+    """
     counts = {
         ROUTE_AI_SMALL: 92,
         ROUTE_AI_LARGE: 6,
@@ -99,9 +103,9 @@ def test_scale_targets_uses_workload_specific_replica_counts(tmp_path):
     }
     targets = _scale_targets(counts)
 
-    # ai-small: 92 / 25 = 3.68 → ceil = 4, under cap of 6
-    assert targets["ai-small-worker"] == 4
-    # ai-large: 6 / 10 = 0.6 → ceil = 1
+    # ai-small: ceil(92 / 50) = 2, hits the max cap of 2
+    assert targets["ai-small-worker"] == 2
+    # ai-large: ceil(6 / 20) = 1
     assert targets["ai-large-worker"] == 1
     # rules-worker handles rules + ocr = 36 / 100 = 0.36 → ceil = 1
     assert targets["rules-worker"] == 1
