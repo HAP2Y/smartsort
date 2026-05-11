@@ -90,7 +90,7 @@ smartsort run ~/Downloads --distributed --backend redis \
 That's it. To scale a single route horizontally:
 
 ```bash
-docker compose up --scale ai-small-worker=4 -d
+docker-compose up --scale ai-small-worker=4 -d
 ```
 
 The dispatcher (your `smartsort run`) is stateless. You can fire it from anywhere that can reach Redis — host shell, another container, CI.
