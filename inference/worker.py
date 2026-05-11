@@ -72,6 +72,7 @@ class Worker:
         started = time.perf_counter()
         error: Optional[str] = None
         classification = None
+        file_name = Path(job.file_path).name
         try:
             file_item = FileItem(path=Path(job.file_path))
             result = self.classifier.classify(file_item)
@@ -83,6 +84,24 @@ class Worker:
 
         duration_ms = (time.perf_counter() - started) * 1000.0
         self.stats.record(duration_ms, ok=error is None)
+
+        # One INFO line per job so `docker compose logs -f` is a usable
+        # progress feed without forcing -vv. Includes the method that
+        # decided the file (Rules / Local AI / etc) so the operator can
+        # see whether the LLM is actually being exercised or whether the
+        # cheap rules path is matching everything.
+        if error:
+            log.warning("[%s] %s -> ERROR (%s) in %.0fms",
+                        self.name, file_name, error, duration_ms)
+        elif classification:
+            log.info("[%s] %s -> %s (%s, %d%%) in %.0fms",
+                     self.name, file_name,
+                     classification.get("category", "?"),
+                     classification.get("method", "?"),
+                     int(classification.get("confidence", 0)),
+                     duration_ms)
+        else:
+            log.info("[%s] %s -> no result in %.0fms", self.name, file_name, duration_ms)
 
         self.backend.publish_result(
             JobResult(

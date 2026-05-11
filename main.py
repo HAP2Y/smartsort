@@ -365,6 +365,16 @@ def _run_distributed(
     timeout: float,
 ) -> dict[str, Classification]:
     """Producer/worker path via the inference package."""
+    from inference.diagnostics import (
+        ProgressReporter,
+        preflight_ollama,
+        preflight_redis,
+        preflight_workers,
+        queue_depths,
+        tail_compose_logs,
+    )
+    from classifier.ai_local import DEFAULT_OLLAMA_URL
+
     backend_kwargs = {"url": redis_url} if backend == "redis" else {}
     qb = build_backend(backend, **backend_kwargs)
     router = Router.default()
@@ -385,19 +395,83 @@ def _run_distributed(
             "start external workers via `smartsort serve-worker` or docker compose.[/yellow]"
         )
 
+    # Compute the per-route counts up-front so preflight knows which
+    # routes need consumers and progress can show denominators.
+    expected_by_route = _route_counts(files, router)
+
+    # ------------------------------------------------- preflight checks
+    if backend == "redis":
+        console.rule("[bold cyan]Pre-flight")
+        checks = [preflight_redis(redis_url)]
+        # Only require workers on routes that actually have jobs queued.
+        active_routes = [r for r, n in expected_by_route.items() if n > 0]
+        checks.extend(preflight_workers(redis_url, active_routes))
+        if any(r in active_routes for r in (ROUTE_AI_SMALL, ROUTE_AI_LARGE)):
+            checks.append(preflight_ollama(DEFAULT_OLLAMA_URL))
+        for c in checks:
+            colour = "green" if c.ok else "red"
+            console.print(f"[{colour}]{c.status} {c.name}[/{colour}]: {c.detail}")
+        blockers = [c for c in checks if not c.ok and c.name == "redis"]
+        if blockers:
+            console.print(
+                "[red]Aborting: cannot reach Redis. Bring the fleet up with --up "
+                "or start it manually with `docker-compose up -d`.[/red]"
+            )
+            qb.close()
+            raise typer.Exit(1)
+        # Worker / Ollama failures are warnings only — the orchestrator's
+        # timeout will still produce a usable plan with fallbacks.
+        console.rule()
+
     orchestrator = Orchestrator(backend=qb, router=router)
     pending = orchestrator.submit(files)
     console.print(f"[cyan]Submitted {len(pending)} jobs via {backend} backend.[/cyan]")
     for route, count in orchestrator.stats.by_route.items():
         console.print(f"  [magenta]{route}[/magenta]: {count}")
 
-    with console.status("[bold green]Awaiting worker results..."):
-        plan = orchestrator.collect(pending, timeout=timeout)
+    # ------------------------------------------------- live progress
+    progress = ProgressReporter(
+        expected_total=len(pending),
+        expected_by_route=dict(orchestrator.stats.by_route),
+        tick_seconds=5.0,
+        _printer=lambda msg: console.print(f"[dim]{msg}[/dim]"),
+    )
+    plan = orchestrator.collect(pending, timeout=timeout, on_result=progress.on_result)
+    progress.final()
 
     for w in inline_workers:
         w.stop()
     for t in threads:
         t.join(timeout=2.0)
+
+    # ------------------------------------------------- post-mortem
+    if backend == "redis" and orchestrator.stats.failed > 0:
+        console.rule("[bold red]Post-mortem")
+        depths = queue_depths(qb, list(expected_by_route))
+        for route, depth in depths.items():
+            if depth > 0:
+                console.print(f"[red]queue {route}[/red]: {depth} entries still in flight")
+        # Best-effort: dump the last few log lines from each compose
+        # service so the user doesn't have to context-switch to find
+        # them. Skipped silently if docker-compose isn't on PATH.
+        ai_busy = (depths.get(ROUTE_AI_SMALL, 0) > 0
+                   or depths.get(ROUTE_AI_LARGE, 0) > 0)
+        services = ["rules-worker"]
+        if ai_busy:
+            services += ["ai-small-worker", "ai-large-worker"]
+        logs = tail_compose_logs(services, lines=5)
+        for svc, body in logs.items():
+            console.print(f"[bold]── {svc} (last 5 log lines) ──[/bold]")
+            console.print(body or "[dim](empty)[/dim]")
+        console.print(
+            "\n[yellow]Hints:[/yellow]\n"
+            "  • If AI workers are slow, switch to a smaller model in config/categories.yaml "
+            "(`models.ai-small: qwen2.5:3b`).\n"
+            "  • Increase --timeout if the queue is just deep.\n"
+            "  • Scale a route by hand: `docker-compose up -d --scale ai-small-worker=N`.\n"
+        )
+        console.rule()
+
     qb.close()
 
     console.print(
@@ -486,6 +560,26 @@ def _print_plan(plan: dict[str, Classification], apply: bool) -> None:
 # --------------------------------------------------- distributed inference
 
 
+def _model_for_route(config: dict, route: str, override: str | None = None) -> str:
+    """Resolve which Ollama model a given route should use.
+
+    Resolution order:
+      1. explicit --model override
+      2. settings.models.<route>             (preferred, per-route)
+      3. settings.large_model                (legacy, for ai-large only)
+      4. settings.default_local_model        (legacy fallback)
+    """
+    if override:
+        return override
+    settings = config["settings"]
+    per_route = (settings.get("models") or {}).get(route)
+    if per_route:
+        return per_route
+    if route == ROUTE_AI_LARGE:
+        return settings.get("large_model", settings["default_local_model"])
+    return settings["default_local_model"]
+
+
 def _build_worker_classifier(route: str, config: dict, model_override: str | None):
     """Pick the right classifier for a given queue route."""
     rules = RulesEngine(str(CONFIG_PATH))
@@ -500,11 +594,7 @@ def _build_worker_classifier(route: str, config: dict, model_override: str | Non
             RulesClassifier(rules),
         ])
     if route in (ROUTE_AI_SMALL, ROUTE_AI_LARGE):
-        model = model_override or (
-            config["settings"].get("large_model", config["settings"]["default_local_model"])
-            if route == ROUTE_AI_LARGE
-            else config["settings"]["default_local_model"]
-        )
+        model = _model_for_route(config, route, model_override)
         ai = LocalAIClassifier(model=model)
         extractor = FileExtractor(max_chars=config["settings"]["max_extract_chars"])
         return ClassificationPipeline([
@@ -561,31 +651,27 @@ def serve_worker(
     classifier = _build_worker_classifier(route_list[0], config, model)
     worker = Worker(name=worker_name, routes=route_list, classifier=classifier, backend=qb)
 
-    # AI routes silently failing on Ollama connectivity is the single most
-    # common operator footgun (e.g. forgetting OLLAMA_HOST inside a
-    # container). Probe once at boot and shout into the log so the user
-    # sees the problem in seconds, not after the orchestrator times out.
+    # Loud, structured startup banner so the user can see at a glance which
+    # model each worker is actually using and whether Ollama is reachable.
     primary = route_list[0]
+    console.rule(f"[bold cyan]Worker {worker_name}")
+    console.print(f"[bold]routes  [/bold] {route_list}")
+    console.print(f"[bold]backend [/bold] {backend}")
     if primary in (ROUTE_AI_SMALL, ROUTE_AI_LARGE):
         from classifier.ai_local import DEFAULT_OLLAMA_URL, LocalAIClassifier
-        model_tag = model or (
-            config["settings"].get("large_model", config["settings"]["default_local_model"])
-            if primary == ROUTE_AI_LARGE
-            else config["settings"]["default_local_model"]
-        )
-        ai = LocalAIClassifier(model=model_tag)
-        ok, msg = ai.is_running()
-        status_colour = "green" if ok else "red"
-        console.print(f"[{status_colour}]Ollama @ {DEFAULT_OLLAMA_URL} → {msg}[/{status_colour}]")
+        resolved_model = _model_for_route(config, primary, model)
+        console.print(f"[bold]model   [/bold] {resolved_model}")
+        console.print(f"[bold]ollama  [/bold] {DEFAULT_OLLAMA_URL}")
+        ok, msg = LocalAIClassifier(model=resolved_model).is_running()
+        colour = "green" if ok else "red"
+        console.print(f"[{colour}]health  → {msg}[/{colour}]")
         if not ok:
             console.print(
-                "[yellow]Worker will keep running and falling back to rules, "
-                "but AI classification is disabled until Ollama is reachable.[/yellow]"
+                "[yellow]Worker will run with rules-fallback only until Ollama is reachable.[/yellow]"
             )
-
-    console.print(
-        f"[green]Worker {worker_name} listening on {route_list} via {backend}.[/green]"
-    )
+    else:
+        console.print(f"[bold]model   [/bold] (rules-only worker, no LLM)")
+    console.rule()
     console.print("[dim]Ctrl-C to stop.[/dim]")
     try:
         worker.run()

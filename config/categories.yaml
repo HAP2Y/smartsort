@@ -187,4 +187,21 @@ categories:
 settings:
   confidence_threshold: 80
   max_extract_chars: 1000
-  default_local_model: "qwen2.5:32b"
+
+  # Per-route Ollama model selection.
+  #
+  # Pull whatever you reference here BEFORE running the workers:
+  #     ollama pull qwen2.5:7b
+  #     ollama pull qwen2.5:14b
+  #
+  # Memory rule of thumb: model parameter count × ~0.7 GB. A 32B model
+  # eats ~20 GB of RAM in Ollama and is ~15-30 s/call on CPU — too heavy
+  # for the ai-small queue, which sees the bulk of the traffic.
+  models:
+    ai-small: "qwen2.5:7b"      # fast model for the fan-out queue
+    ai-large: "qwen2.5:14b"     # bigger context for large extractable docs
+
+  # Legacy keys, kept for backward compat with the inline `smartsort run`
+  # path. Distributed workers prefer `models.<route>` above.
+  default_local_model: "qwen2.5:7b"
+  large_model: "qwen2.5:14b"

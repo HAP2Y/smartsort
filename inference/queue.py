@@ -26,6 +26,16 @@ DEFAULT_RESULT_STREAM = "smartsort:results"
 DEFAULT_JOB_STREAM_PREFIX = "smartsort:jobs:"
 DEFAULT_GROUP = "smartsort-workers"
 
+__all__ = [
+    "DEFAULT_RESULT_STREAM",
+    "DEFAULT_JOB_STREAM_PREFIX",
+    "DEFAULT_GROUP",
+    "QueueBackend",
+    "InMemoryQueueBackend",
+    "RedisStreamBackend",
+    "build_backend",
+]
+
 
 class QueueBackend(Protocol):
     def enqueue(self, job: Job) -> None: ...

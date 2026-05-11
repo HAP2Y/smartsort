@@ -16,7 +16,7 @@ The platform is workload-agnostic. File classification is the reference implemen
 - **Workload-aware autoscaling** — the dispatcher pre-routes the file set locally, sizes the Compose fleet to match (more `ai-small` replicas when there are lots of small PDFs, more `ai-large` when there are big ones), and brings it up in one command.
 - **Fault isolation across the queue boundary** — a crashing worker reports the exception as a `JobResult.error` instead of poisoning the queue; the orchestrator fills timeouts with `Unknown_Unsorted` so the end-user always receives a complete plan.
 - **Container-ready scale path** — Dockerfile + Compose stack with Redis, per-route worker pools, and an on-demand dispatcher. `docker-compose up --scale ai-small-worker=4` is the entire horizontal scale story; the same image is the building block for a Kubernetes Deployment.
-- **157 tests, fully offline** — the network is mocked end-to-end. CI runs the same suite plus an out-of-process CLI smoke test.
+- **175 tests, fully offline** — the network is mocked end-to-end. CI runs the same suite plus an out-of-process CLI smoke test.
 
 ---
 
@@ -171,7 +171,53 @@ ollama pull qwen2.5:7b      # ~5 GB
 ollama pull qwen2.5:3b      # ~2 GB
 ```
 
-…and set `default_local_model: qwen2.5:7b` in `config/categories.yaml`.
+…and set `models.ai-small: qwen2.5:7b` in `config/categories.yaml`.
+
+---
+
+## Diagnostics
+
+The dispatcher does three things to keep distributed runs debuggable:
+
+**Pre-flight.** Before submitting, `--distributed --backend redis` checks that Redis is reachable, that each route with queued work has at least one consumer subscribed (via `XINFO CONSUMERS`), and that Ollama answers on the configured host. The check panel is printed up front:
+
+```
+── Pre-flight ─────────────────────────────────────────
+✓ redis:           reachable at redis://localhost:6379/0
+✓ workers/rules:   1 consumer(s): rules-1
+✓ workers/ai-small: 2 consumer(s): ai-small-1, ai-small-2
+✓ ollama:          reachable at http://localhost:11434
+```
+
+If Redis is down, the dispatcher aborts immediately rather than enqueuing jobs nobody can drain.
+
+**Live progress.** While the orchestrator drains the result stream, a one-line summary prints every 5 seconds:
+
+```
+[ 30s] 47/134 done | rules 24/26 | ocr 0/10 | ai-small 21/92 | ai-large 2/6
+[ 60s] 78/134 done | rules 26/26 | ocr 4/10 | ai-small 44/92 | ai-large 4/6
+```
+
+**Per-job worker logs.** With `-v` (the default for compose workers), every worker prints one INFO line per job:
+
+```
+ai-small-1: Resume.pdf -> Resumes_Career_Tech (Local AI, 92%) in 8240ms
+ai-small-1: report.zip -> ERROR (Timeout: read timed out) in 60010ms
+```
+
+Tail any worker with `docker-compose logs -f ai-small-worker` to watch jobs flow in real time.
+
+**Post-mortem on timeout.** If anything failed when the timeout hit, the dispatcher prints which queues still have entries in flight and dumps the last 5 log lines from each compose worker so you don't have to context-switch:
+
+```
+── Post-mortem ────────────────────────────────────────
+queue ai-small: 14 entries still in flight
+── ai-small-worker (last 5 log lines) ──
+... worker ai-small-1 starting on routes=['ai-small']
+... ai-small-1: report.pdf -> Resumes_Career_Tech (Local AI, 87%) in 12450ms
+```
+
+Plus a hint block suggesting the typical next step (smaller model, longer timeout, more replicas).
 
 ### Manual lifecycle
 
@@ -246,12 +292,35 @@ Categories live in `config/categories.yaml`. Adding a new classification source 
 
 ## Settings
 
+`config/categories.yaml` is the single source of truth for everything operational.
+
 | Setting | Purpose |
 | --- | --- |
 | `confidence_threshold` | Minimum AI confidence (0–100) before AI's answer is accepted. |
 | `max_extract_chars` | Upper bound on characters extracted per file before the LLM sees it. |
-| `default_local_model` | Ollama tag for `ai-small` (e.g. `qwen2.5:14b`). Must be pulled locally. |
-| `large_model` *(optional)* | Ollama tag for `ai-large`. Defaults to `default_local_model`. |
+| `models.<route>` | **Per-route model** — what each AI worker actually loads (e.g. `models.ai-small: qwen2.5:7b`). |
+| `default_local_model` | Legacy fallback used by the inline `smartsort run` path and as the default for `ai-small` if `models.ai-small` is unset. |
+| `large_model` | Legacy fallback for `ai-large` if `models.ai-large` is unset. |
+
+Resolution order for AI workers: `--model` CLI flag → `settings.models.<route>` → legacy `large_model`/`default_local_model`. The worker prints which model it ended up using at startup.
+
+### Picking a model
+
+Memory rule of thumb: **parameter count × ~0.7 GB**. Pick per-route based on traffic shape:
+
+| Model | RAM in Ollama | Calls/min on M-series CPU | Good for |
+| --- | --- | --- | --- |
+| `qwen2.5:3b` | ~2 GB | 30–60 | high-throughput `ai-small` on a small machine |
+| `qwen2.5:7b` | ~5 GB | 15–30 | recommended default for `ai-small` |
+| `qwen2.5:14b` | ~9 GB | 5–10 | `ai-small` on a beefy box, `ai-large` default |
+| `qwen2.5:32b` | ~20 GB | 1–3 | `ai-large` only — too slow for the fan-out queue |
+
+Pull whatever you reference before running:
+
+```bash
+ollama pull qwen2.5:7b
+ollama pull qwen2.5:14b
+```
 
 ---
 
@@ -279,7 +348,7 @@ Dockerfile                 # slim base image used by the rules-worker
 Dockerfile.ai              # adds PyMuPDF + python-docx for AI workers
 docker-compose.yml         # redis + per-route worker pools (with mem_limit)
 main.py                    # run, undo, check-rules, serve-worker
-tests/                     # 157 tests, all offline
+tests/                     # 175 tests, all offline
 ```
 
 ---
@@ -290,7 +359,7 @@ tests/                     # 157 tests, all offline
 python -m pytest tests/ -q
 ```
 
-157 tests covering the rules engine, the `Classification` pipeline, the Ollama client (network mocked), text extraction, PII redaction, organizer move + undo round-trips, an end-to-end CLI dry-run, plus the distributed-inference layer: queue round-trips, router decisions, worker exception capture, and an end-to-end orchestrator run with stub workers.
+175 tests covering the rules engine, the `Classification` pipeline, the Ollama client (network mocked), text extraction, PII redaction, organizer move + undo round-trips, an end-to-end CLI dry-run, plus the distributed-inference layer: queue round-trips, router decisions, worker exception capture, and an end-to-end orchestrator run with stub workers.
 
 CI runs the same suite plus an out-of-process CLI smoke test (`.github/workflows/ci.yml`).
 
