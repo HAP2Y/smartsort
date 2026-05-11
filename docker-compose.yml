@@ -1,0 +1,82 @@
+# Local dev stack for the distributed inference prototype.
+#
+# Bring it up with:    docker compose up --build
+# Submit a directory:  docker compose run --rm dispatcher \
+#                          dispatch /work --backend redis --redis-url redis://redis:6379/0
+#
+# The two worker services illustrate the routing topology: one pool consumes
+# the cheap "rules" queue, the other consumes the AI queues. Add more
+# instances of either with `docker compose up --scale ai-worker=4`.
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  rules-worker:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+    command:
+      - serve-worker
+      - --route
+      - rules
+      - --backend
+      - redis
+      - --redis-url
+      - redis://redis:6379/0
+    volumes:
+      - ./workdir:/work
+
+  ai-small-worker:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    command:
+      - serve-worker
+      - --route
+      - ai-small
+      - --backend
+      - redis
+      - --redis-url
+      - redis://redis:6379/0
+    volumes:
+      - ./workdir:/work
+
+  ai-large-worker:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    command:
+      - serve-worker
+      - --route
+      - ai-large
+      - --backend
+      - redis
+      - --redis-url
+      - redis://redis:6379/0
+    volumes:
+      - ./workdir:/work
+
+  dispatcher:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles: ["cli"]   # only runs on explicit `docker compose run dispatcher`
+    volumes:
+      - ./workdir:/work
+    entrypoint: ["python", "main.py"]
