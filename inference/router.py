@@ -1,7 +1,12 @@
-"""Decide which queue a file should land on.
+"""Decide which worker queue a file should land on.
+
+Routing only handles cases the **prefilter could not classify locally**.
+The cheap filename-rules path runs on the dispatcher before this code ever
+sees a file, so the router's job is narrowly: of the remaining "needs a
+worker" files, pick the right AI / OCR queue based on file traits.
 
 The router is a pure function over file traits. Keeping it data-driven
-(``RouteRule`` list) means we can later load routes from config without
+(``RouteRule`` list) means routes can later be loaded from config without
 touching code.
 """
 from __future__ import annotations
@@ -12,14 +17,22 @@ from typing import Callable, Optional
 
 from classifier.types import FileItem
 
-ROUTE_RULES = "rules"
 ROUTE_AI_SMALL = "ai-small"
 ROUTE_AI_LARGE = "ai-large"
 ROUTE_OCR = "ocr"
+# Sentinel: file landed here means the dispatcher should classify it as
+# Unknown_Unsorted locally rather than enqueueing — e.g. an image when no
+# OCR worker is implemented yet. Removes the need for an OCR placeholder
+# worker that just times out.
+ROUTE_UNROUTABLE = "unroutable"
+# Legacy: kept so external tests / callers can construct stub workers on a
+# `rules` queue. Never produced by the default router any more — cheap
+# rules classification happens on the dispatcher via Prefilter.
+ROUTE_RULES = "rules"
 
 # Files larger than this go to the large-context model.
 LARGE_FILE_BYTES = 2 * 1024 * 1024
-EXTRACTABLE_EXTS = {".pdf", ".docx", ".txt", ".md", ".csv", ".rtf"}
+EXTRACTABLE_EXTS = {".pdf", ".docx", ".txt", ".md", ".csv", ".rtf", ".html", ".eml", ".json", ".xml", ".log"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 
@@ -27,7 +40,7 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 class RouteRule:
     """A single ``predicate -> route`` mapping.
 
-    The first matching rule wins. Predicates are pure functions of FileItem
+    First matching rule wins. Predicates are pure functions of FileItem
     plus the file's size in bytes (passed in so we don't stat the file twice).
     """
     route: str
@@ -39,7 +52,7 @@ class RouteRule:
 class Router:
     """First-match router over a configurable rule list."""
     rules: list[RouteRule] = field(default_factory=list)
-    default_route: str = ROUTE_RULES
+    default_route: str = ROUTE_UNROUTABLE
 
     def route(self, file: FileItem) -> str:
         size = _safe_size(file.path)
@@ -65,10 +78,10 @@ class Router:
                 RouteRule(
                     route=ROUTE_AI_SMALL,
                     predicate=lambda f, s: f.ext in EXTRACTABLE_EXTS and s < LARGE_FILE_BYTES,
-                    note="Small docs go to the fast model.",
+                    note="Small extractable docs go to the fast model.",
                 ),
             ],
-            default_route=ROUTE_RULES,
+            default_route=ROUTE_UNROUTABLE,
         )
 
 
@@ -83,5 +96,5 @@ def describe_routes(router: Optional[Router] = None) -> list[tuple[str, str]]:
     """Human-readable summary of the configured routes (for `--help`-style output)."""
     r = router or Router.default()
     out = [(rule.route, rule.note or "") for rule in r.rules]
-    out.append((r.default_route, "Fallback route when no rule matches."))
+    out.append((r.default_route, "Files the dispatcher can't route to any worker; classified Unknown locally."))
     return out

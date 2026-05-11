@@ -174,15 +174,13 @@ def run(
 
     brought_up = False
     if up:
-        # Pre-route locally to size the fleet for the actual workload.
-        # Router.route() is pure (filename + size only), so doing it here and
-        # again inside the orchestrator is cheap and avoids leaking router
-        # internals into _compose_up.
+        # Pre-route locally to size the fleet — every file goes through
+        # an AI worker, so the autoscaler counts cover the full workload.
         counts = _route_counts(files, Router.default())
         targets = _scale_targets(counts)
         console.print(
             "[dim]Route counts: "
-            + ", ".join(f"{r}={n}" for r, n in sorted(counts.items()))
+            + (", ".join(f"{r}={n}" for r, n in sorted(counts.items())) or "none")
             + "[/dim]"
         )
         brought_up = _compose_up(scale=targets)
@@ -240,23 +238,19 @@ def _run_local(*, files: list[Path], config: dict, no_ai: bool) -> dict[str, Cla
 
 # Per-route scale tuning.
 #
-# `files_per_worker` is the soft saturation point — above it we add another
-# worker. `max_workers` caps the autoscaler so a directory of 10k files
-# doesn't try to spawn 400 containers.
+# Only AI workers exist as Compose services — rules are run inline on the
+# dispatcher (the queue is for expensive work, not for filename matching),
+# and OCR has no implementation yet so OCR-routed files are classified as
+# Unknown locally rather than enqueued.
 #
-# AI route caps are deliberately conservative. The throughput bottleneck on
-# AI routes is the single host Ollama instance, not the Python worker — once
-# Ollama is saturated, extra workers just queue on it while burning memory
-# (each container is ~150 MB, and the Ollama-side serialisation means
-# replicas past 2-3 give zero throughput gain on a single GPU / CPU). If you
-# point workers at a multi-instance Ollama setup, raise these caps.
-#
-# rules-worker subscribes to both `rules` and `ocr`, so its scaling target
-# combines the two route counts.
+# `files_per_worker` is the soft saturation point. `max_workers` caps the
+# autoscaler so a directory of 10k files doesn't spawn 400 containers.
+# Caps stay low because a single host Ollama serialises LLM calls — replicas
+# past 2-3 add memory pressure without throughput. Point at a multi-instance
+# Ollama setup and raise the caps to scale further.
 COMPOSE_SCALE = {
-    "rules-worker":    {"files_per_worker": 100, "max_workers": 2},
-    "ai-small-worker": {"files_per_worker": 50,  "max_workers": 2},
-    "ai-large-worker": {"files_per_worker": 20,  "max_workers": 1},
+    "ai-small-worker": {"files_per_worker": 25, "max_workers": 2},
+    "ai-large-worker": {"files_per_worker": 10, "max_workers": 1},
 }
 
 
@@ -288,12 +282,15 @@ def _route_counts(files: list[Path], router: Router) -> dict[str, int]:
 
 
 def _scale_targets(counts: dict[str, int]) -> dict[str, int]:
-    """Map compose service -> desired replicas, sized for the workload."""
+    """Map compose service -> desired replicas, sized for the workload.
+
+    Only AI services scale here — rules and OCR are not Compose services
+    in the new architecture (rules runs inline; OCR is unimplemented and
+    classified Unknown on the dispatcher).
+    """
     import math
-    # rules-worker handles both rules and ocr queues (see docker-compose.yml).
-    rules_total = counts.get(ROUTE_RULES, 0) + counts.get(ROUTE_OCR, 0)
-    ai_small    = counts.get(ROUTE_AI_SMALL, 0)
-    ai_large    = counts.get(ROUTE_AI_LARGE, 0)
+    ai_small = counts.get(ROUTE_AI_SMALL, 0)
+    ai_large = counts.get(ROUTE_AI_LARGE, 0)
 
     def _scale(jobs: int, cfg: dict) -> int:
         if jobs <= 0:
@@ -301,9 +298,8 @@ def _scale_targets(counts: dict[str, int]) -> dict[str, int]:
         return min(cfg["max_workers"], max(1, math.ceil(jobs / cfg["files_per_worker"])))
 
     return {
-        "rules-worker":    _scale(rules_total, COMPOSE_SCALE["rules-worker"]),
-        "ai-small-worker": _scale(ai_small,    COMPOSE_SCALE["ai-small-worker"]),
-        "ai-large-worker": _scale(ai_large,    COMPOSE_SCALE["ai-large-worker"]),
+        "ai-small-worker": _scale(ai_small, COMPOSE_SCALE["ai-small-worker"]),
+        "ai-large-worker": _scale(ai_large, COMPOSE_SCALE["ai-large-worker"]),
     }
 
 
@@ -364,7 +360,15 @@ def _run_distributed(
     workers: int,
     timeout: float,
 ) -> dict[str, Classification]:
-    """Producer/worker path via the inference package."""
+    """Producer/worker path via the inference package.
+
+    Architecture: every file goes onto an AI worker queue. Workers run
+    AI-first (Local AI → HC rules → fallback rules), so the LLM gets to
+    weigh in on every file and rules only catch the cases where AI
+    declines. The router still picks ai-small / ai-large by size +
+    extension; images route to UNROUTABLE (no OCR worker today) and are
+    classified Unknown_Unsorted on the dispatcher with a clear reason.
+    """
     from inference.diagnostics import (
         ProgressReporter,
         preflight_ollama,
@@ -373,37 +377,61 @@ def _run_distributed(
         queue_depths,
         tail_compose_logs,
     )
+    from inference.router import ROUTE_UNROUTABLE
     from classifier.ai_local import DEFAULT_OLLAMA_URL
 
     backend_kwargs = {"url": redis_url} if backend == "redis" else {}
     qb = build_backend(backend, **backend_kwargs)
     router = Router.default()
 
+    # -------------------- Pre-route locally so unroutable files (e.g.
+    # images without an OCR worker) get a clean "Unknown" verdict instead
+    # of being enqueued to a queue that nobody drains.
+    plan: dict[str, Classification] = {}
+    enqueueable: list[Path] = []
+    for path in files:
+        route = router.route(FileItem(path=path))
+        if route == ROUTE_UNROUTABLE:
+            plan[str(path)] = Classification.unknown(
+                reason="no AI / OCR worker available for this file type",
+                method="Router",
+            )
+        else:
+            enqueueable.append(path)
+
+    if not enqueueable:
+        console.print("[cyan]No files require worker processing.[/cyan]")
+        qb.close()
+        return plan
+
+    # -------------------- Inline workers for the memory backend
     inline_workers: list[Worker] = []
     threads: list = []
     if workers > 0 and backend == "memory":
-        for route in (ROUTE_RULES, ROUTE_AI_SMALL, ROUTE_AI_LARGE, ROUTE_OCR):
+        for route in (ROUTE_AI_SMALL, ROUTE_AI_LARGE):
             for i in range(workers):
                 classifier = _build_worker_classifier(route, config, None)
                 w = Worker(name=f"{route}-{i}", routes=[route], classifier=classifier, backend=qb)
                 inline_workers.append(w)
                 threads.append(w.run_in_thread())
-        console.print(f"[dim]Spawned {len(inline_workers)} inline workers across 4 routes.[/dim]")
+        console.print(f"[dim]Spawned {len(inline_workers)} inline AI workers.[/dim]")
     elif workers > 0 and backend == "redis":
         console.print(
             "[yellow]--workers ignored with --backend=redis; "
-            "start external workers via `smartsort serve-worker` or docker compose.[/yellow]"
+            "start external workers via `smartsort serve-worker` or docker-compose.[/yellow]"
         )
 
-    # Compute the per-route counts up-front so preflight knows which
-    # routes need consumers and progress can show denominators.
-    expected_by_route = _route_counts(files, router)
+    # Per-route counts so preflight knows which routes need consumers
+    # and progress reporting can show denominators.
+    expected_by_route: dict[str, int] = {}
+    for path in enqueueable:
+        r = router.route(FileItem(path=path))
+        expected_by_route[r] = expected_by_route.get(r, 0) + 1
 
-    # ------------------------------------------------- preflight checks
+    # -------------------- Pre-flight
     if backend == "redis":
         console.rule("[bold cyan]Pre-flight")
         checks = [preflight_redis(redis_url)]
-        # Only require workers on routes that actually have jobs queued.
         active_routes = [r for r, n in expected_by_route.items() if n > 0]
         checks.extend(preflight_workers(redis_url, active_routes))
         if any(r in active_routes for r in (ROUTE_AI_SMALL, ROUTE_AI_LARGE)):
@@ -419,56 +447,53 @@ def _run_distributed(
             )
             qb.close()
             raise typer.Exit(1)
-        # Worker / Ollama failures are warnings only — the orchestrator's
-        # timeout will still produce a usable plan with fallbacks.
         console.rule()
 
+    # -------------------- Submit + drain
     orchestrator = Orchestrator(backend=qb, router=router)
-    pending = orchestrator.submit(files)
+    pending = orchestrator.submit(enqueueable)
     console.print(f"[cyan]Submitted {len(pending)} jobs via {backend} backend.[/cyan]")
     for route, count in orchestrator.stats.by_route.items():
         console.print(f"  [magenta]{route}[/magenta]: {count}")
 
-    # ------------------------------------------------- live progress
     progress = ProgressReporter(
         expected_total=len(pending),
         expected_by_route=dict(orchestrator.stats.by_route),
         tick_seconds=5.0,
         _printer=lambda msg: console.print(f"[dim]{msg}[/dim]"),
     )
-    plan = orchestrator.collect(pending, timeout=timeout, on_result=progress.on_result)
+    worker_plan = orchestrator.collect(pending, timeout=timeout, on_result=progress.on_result)
     progress.final()
+    plan.update(worker_plan)
 
     for w in inline_workers:
         w.stop()
     for t in threads:
         t.join(timeout=2.0)
 
-    # ------------------------------------------------- post-mortem
+    # -------------------- Post-mortem (only on failures)
     if backend == "redis" and orchestrator.stats.failed > 0:
         console.rule("[bold red]Post-mortem")
         depths = queue_depths(qb, list(expected_by_route))
         for route, depth in depths.items():
             if depth > 0:
                 console.print(f"[red]queue {route}[/red]: {depth} entries still in flight")
-        # Best-effort: dump the last few log lines from each compose
-        # service so the user doesn't have to context-switch to find
-        # them. Skipped silently if docker-compose isn't on PATH.
-        ai_busy = (depths.get(ROUTE_AI_SMALL, 0) > 0
-                   or depths.get(ROUTE_AI_LARGE, 0) > 0)
-        services = ["rules-worker"]
-        if ai_busy:
-            services += ["ai-small-worker", "ai-large-worker"]
-        logs = tail_compose_logs(services, lines=5)
-        for svc, body in logs.items():
-            console.print(f"[bold]── {svc} (last 5 log lines) ──[/bold]")
-            console.print(body or "[dim](empty)[/dim]")
+        services = []
+        if depths.get(ROUTE_AI_SMALL, 0) > 0:
+            services.append("ai-small-worker")
+        if depths.get(ROUTE_AI_LARGE, 0) > 0:
+            services.append("ai-large-worker")
+        if services:
+            logs = tail_compose_logs(services, lines=10)
+            for svc, body in logs.items():
+                console.print(f"[bold]── {svc} (last 10 log lines) ──[/bold]")
+                console.print(body or "[dim](empty)[/dim]")
         console.print(
             "\n[yellow]Hints:[/yellow]\n"
-            "  • If AI workers are slow, switch to a smaller model in config/categories.yaml "
-            "(`models.ai-small: qwen2.5:3b`).\n"
-            "  • Increase --timeout if the queue is just deep.\n"
-            "  • Scale a route by hand: `docker-compose up -d --scale ai-small-worker=N`.\n"
+            "  • Smaller / faster model: set `models.ai-small: qwen2.5:3b` in config/categories.yaml.\n"
+            "  • Longer timeout: --timeout 1200.\n"
+            "  • More replicas: `docker-compose up -d --scale ai-small-worker=N`.\n"
+            "  • Lower confidence_threshold so the LLM's lower-confidence answers count.\n"
         )
         console.rule()
 
@@ -581,30 +606,34 @@ def _model_for_route(config: dict, route: str, override: str | None = None) -> s
 
 
 def _build_worker_classifier(route: str, config: dict, model_override: str | None):
-    """Pick the right classifier for a given queue route."""
+    """Pick the right classifier for a given queue route.
+
+    Pipeline order is **AI first**, rules as a fallback. The previous
+    order (HC-rules → AI → rules) meant every file with a familiar
+    keyword in its name short-circuited the LLM, so the AI fleet was
+    expensive plumbing that almost never ran. Now the LLM gets to weigh
+    in on every file the dispatcher hands it; rules only catch the
+    cases where the LLM declines (no extractable text, output not in
+    the allowed category set, confidence below threshold).
+    """
     rules = RulesEngine(str(CONFIG_PATH))
     categories = list(config["categories"].keys())
     threshold = config["settings"]["confidence_threshold"]
 
-    if route == ROUTE_RULES:
-        # Combine HC + fallback rules behind a tiny pipeline so the worker
-        # presents one Classifier surface to the queue runner.
-        return ClassificationPipeline([
-            HighConfidenceRulesClassifier(rules),
-            RulesClassifier(rules),
-        ])
     if route in (ROUTE_AI_SMALL, ROUTE_AI_LARGE):
         model = _model_for_route(config, route, model_override)
         ai = LocalAIClassifier(model=model)
         extractor = FileExtractor(max_chars=config["settings"]["max_extract_chars"])
         return ClassificationPipeline([
-            HighConfidenceRulesClassifier(rules),  # cheap gate before LLM
             LocalAIPipelineClassifier(ai, extractor, categories, threshold, enabled=True),
-            RulesClassifier(rules),  # safety net if AI declines
+            HighConfidenceRulesClassifier(rules),  # safety net: unambiguous filename markers
+            RulesClassifier(rules),                # last resort: keyword + extension fallback
         ])
-    if route == ROUTE_OCR:
-        # OCR is not implemented yet; fall back to rules so the queue still drains.
-        log.warning("OCR route not implemented; serving rules-only worker for %s", route)
+    if route in (ROUTE_RULES, ROUTE_OCR):
+        log.warning(
+            "route %r has no dedicated worker in the new architecture; "
+            "serving as rules-pipeline for backward compatibility", route,
+        )
         return ClassificationPipeline([
             HighConfidenceRulesClassifier(rules),
             RulesClassifier(rules),

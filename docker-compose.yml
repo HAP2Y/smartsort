@@ -1,16 +1,21 @@
 # Local development stack for the distributed inference runtime.
 #
+# Architecture: AI is the primary classifier. Rules / OCR don't have
+# dedicated worker containers any more — rules run as a fallback INSIDE
+# the AI worker pipeline (when the LLM declines), and OCR-routed files
+# (images) are flagged Unknown on the dispatcher until a real OCR
+# classifier ships.
+#
 # Resource budget (full fleet, default scale):
-#   redis              ~30 MB
-#   rules-worker (1)   ~80 MB   (slim image, no PyMuPDF/docx)
-#   ai-small-worker(2) ~150 MB each
-#   ai-large-worker(1) ~150 MB
-# Total inside Docker: ~600 MB. Ollama on the host adds the model size
-# (qwen2.5:14b = ~9 GB, qwen2.5:32b = ~20 GB). Use `large_model` carefully.
+#   redis              ~30 MB   (capped at 128 MB)
+#   ai-small-worker(2) ~150 MB each (capped at 768 MB)
+#   ai-large-worker(1) ~150 MB    (capped at 768 MB)
+# Total inside Docker: ~500 MB. Ollama on the host adds the model size
+# (qwen2.5:7b ≈ 5 GB, qwen2.5:14b ≈ 9 GB).
 #
 # Usage:
-#   docker-compose up --build              # start redis + one worker per route
-#   docker-compose up --scale ai-small-worker=2   # cap to avoid Ollama queue thrash
+#   docker-compose up --build           # start redis + AI workers
+#   docker-compose up --scale ai-small-worker=2
 
 x-worker-base: &worker-base
   depends_on:
@@ -33,25 +38,6 @@ services:
       timeout: 2s
       retries: 10
     mem_limit: 128m
-
-  # Cheap worker on the slim image: drains the rules queue AND the OCR
-  # queue (OCR currently falls back to rules until a real OCR classifier
-  # ships). One process, two routes — same slim image.
-  rules-worker:
-    <<: *worker-base
-    build:
-      context: .
-      dockerfile: Dockerfile
-    mem_limit: 256m
-    command:
-      - serve-worker
-      - --routes
-      - rules,ocr
-      - --backend
-      - redis
-      - --redis-url
-      - redis://redis:6379/0
-      - -v
 
   ai-small-worker:
     <<: *worker-base

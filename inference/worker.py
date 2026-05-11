@@ -44,6 +44,10 @@ class Worker:
     classifier: Classifier
     backend: QueueBackend
     poll_timeout: float = 1.0
+    # Emit a heartbeat log every N seconds even when idle. Without this a
+    # silent worker is indistinguishable from a hung one — operators only
+    # learn it's alive when a job comes through, which can be hours apart.
+    heartbeat_seconds: float = 30.0
     stats: WorkerStats = field(default_factory=WorkerStats)
     _stop: threading.Event = field(default_factory=threading.Event)
 
@@ -52,12 +56,32 @@ class Worker:
 
     def run(self) -> None:
         log.info("worker %s starting on routes=%s", self.name, self.routes)
+        last_heartbeat = time.time()
         while not self._stop.is_set():
-            item = self.backend.dequeue(self.routes, timeout=self.poll_timeout)
+            try:
+                item = self.backend.dequeue(self.routes, timeout=self.poll_timeout)
+            except Exception:
+                # A dead Redis socket or transient broker error must not
+                # kill the worker — log and back off briefly so we don't
+                # tight-loop hammering a broken broker.
+                log.exception("worker %s: dequeue failed; retrying in 2 s", self.name)
+                self._stop.wait(2.0)
+                continue
+
+            now = time.time()
+            if now - last_heartbeat >= self.heartbeat_seconds:
+                log.info(
+                    "worker %s heartbeat: routes=%s processed=%d failed=%d",
+                    self.name, self.routes, self.stats.processed, self.stats.failed,
+                )
+                last_heartbeat = now
+
             if item is None:
                 continue
             job, ack_token = item
             self._handle(job, ack_token)
+            last_heartbeat = time.time()  # job log already proves we're alive
+
         log.info(
             "worker %s stopped (processed=%d failed=%d)",
             self.name, self.stats.processed, self.stats.failed,

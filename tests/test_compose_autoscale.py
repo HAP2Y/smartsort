@@ -1,9 +1,13 @@
 """Workload-aware autoscaler math.
 
 `smartsort run --up` pre-routes the file set locally and asks
-`_scale_targets` how many replicas to bring up per service. The math is
+`_scale_targets` how many AI worker replicas to bring up. The math is
 pure and worth pinning so future tuning to `COMPOSE_SCALE` doesn't
 accidentally break the contract.
+
+In the AI-first architecture only `ai-small-worker` and
+`ai-large-worker` are Compose services — rules run inline as a fallback
+inside the AI worker pipeline, and OCR has no dedicated worker yet.
 """
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ from inference.router import (
     ROUTE_AI_LARGE,
     ROUTE_AI_SMALL,
     ROUTE_OCR,
-    ROUTE_RULES,
+    ROUTE_UNROUTABLE,
     Router,
 )
 from main import COMPOSE_SCALE, _route_counts, _scale_targets
@@ -32,21 +36,20 @@ def test_route_counts_tallies_each_queue(tmp_path):
 
     counts = _route_counts([small, big, img, misc], Router.default())
 
+    # Unmatched files now route to UNROUTABLE (Unknown locally on dispatcher).
     assert counts == {
         ROUTE_AI_SMALL: 1,
         ROUTE_AI_LARGE: 1,
         ROUTE_OCR: 1,
-        ROUTE_RULES: 1,
+        ROUTE_UNROUTABLE: 1,
     }
 
 
 def test_scale_targets_keeps_one_warm_worker_per_service_when_idle():
-    """No jobs anywhere → still bring up one of each (cold start latency
-    matters more than container count when the user is going to submit
-    again in a moment)."""
+    """No jobs anywhere → still bring up one of each AI service so the
+    next dispatch doesn't pay cold-start latency."""
     targets = _scale_targets({})
     assert targets == {
-        "rules-worker": 1,
         "ai-small-worker": 1,
         "ai-large-worker": 1,
     }
@@ -66,46 +69,34 @@ def test_scale_targets_caps_at_max_replicas():
     targets = _scale_targets({
         ROUTE_AI_SMALL: huge,
         ROUTE_AI_LARGE: huge,
-        ROUTE_RULES: huge,
-        ROUTE_OCR: huge,
     })
     assert targets["ai-small-worker"] == COMPOSE_SCALE["ai-small-worker"]["max_workers"]
     assert targets["ai-large-worker"] == COMPOSE_SCALE["ai-large-worker"]["max_workers"]
-    assert targets["rules-worker"]    == COMPOSE_SCALE["rules-worker"]["max_workers"]
 
 
-def test_rules_worker_scale_combines_rules_and_ocr_counts():
-    """The rules-worker container subscribes to BOTH the rules and ocr
-    queues, so its replica count must reflect the sum of those queues."""
-    fpw = COMPOSE_SCALE["rules-worker"]["files_per_worker"]
-    # Split the load so neither queue alone would trigger scale-up but the
-    # combined load does.
-    counts = {
-        ROUTE_RULES: fpw // 2 + 1,
-        ROUTE_OCR:   fpw // 2 + 1,
-    }
-    targets = _scale_targets(counts)
-    assert targets["rules-worker"] == 2  # combined > fpw → ceil(N/fpw) = 2
+def test_scale_targets_ignores_ocr_and_unroutable_routes():
+    """OCR + UNROUTABLE files are handled on the dispatcher (Unknown
+    locally) — they must not influence the AI worker scale."""
+    targets = _scale_targets({
+        ROUTE_OCR: 50,
+        ROUTE_UNROUTABLE: 100,
+    })
+    # Falls back to the warm-worker baseline — neither AI route has work.
+    assert targets == {"ai-small-worker": 1, "ai-large-worker": 1}
 
 
 def test_scale_targets_uses_workload_specific_replica_counts(tmp_path):
-    """A real example: 92 ai-small jobs, 6 ai-large, 26 rules, 10 ocr —
-    the exact split from the user's debugging run.
-
-    AI route caps are deliberately conservative because Ollama is the
-    single-instance bottleneck (see `COMPOSE_SCALE` doc-string in main.py).
-    """
+    """The 134-file split from the debugging run, after the rules+ocr
+    queues were dropped: only AI counts drive scale now."""
     counts = {
         ROUTE_AI_SMALL: 92,
         ROUTE_AI_LARGE: 6,
-        ROUTE_RULES: 26,
-        ROUTE_OCR: 10,
+        ROUTE_OCR: 10,           # → unrouted, no influence
+        ROUTE_UNROUTABLE: 26,    # → no influence
     }
     targets = _scale_targets(counts)
 
-    # ai-small: ceil(92 / 50) = 2, hits the max cap of 2
-    assert targets["ai-small-worker"] == 2
-    # ai-large: ceil(6 / 20) = 1
+    # ai-small: ceil(92 / 25) = 4 but capped at max_workers=2.
+    assert targets["ai-small-worker"] == COMPOSE_SCALE["ai-small-worker"]["max_workers"]
+    # ai-large: ceil(6 / 10) = 1.
     assert targets["ai-large-worker"] == 1
-    # rules-worker handles rules + ocr = 36 / 100 = 0.36 → ceil = 1
-    assert targets["rules-worker"] == 1

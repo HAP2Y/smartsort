@@ -51,10 +51,18 @@ The platform is workload-agnostic. File classification is the reference implemen
 
 | Route | Sent here when | Worker classifier |
 | --- | --- | --- |
-| `rules` | fallback when nothing else matches | filename rules engine |
-| `ai-small` | small extractable docs (.pdf / .docx / .txt < 2 MB) | small Ollama model + rules safety net |
-| `ai-large` | large extractable docs ≥ 2 MB | larger Ollama model + rules safety net |
-| `ocr` | images (.png / .jpg / .tif / .bmp / ...) | rules fallback until a real OCR worker lands |
+| `ai-small` | small extractable docs (.pdf / .docx / .txt / ...) under 2 MB | **Local AI → HC rules → fallback rules** |
+| `ai-large` | large extractable docs ≥ 2 MB | **Local AI → HC rules → fallback rules** (larger model) |
+| `ocr` | images (.png / .jpg / ...) | not implemented — dispatcher classifies as Unknown locally |
+| `unroutable` | exotic types the router can't place | dispatcher classifies as Unknown locally |
+
+**Pipeline order matters.** AI runs first on every file the worker
+sees, so the LLM gets to weigh in on every document. Rules only catch
+the cases where AI declines (no extractable text, output not in the
+allowed category set, confidence below `confidence_threshold`). The
+previous order put HC rules first, which short-circuited the LLM for
+any filename with a familiar keyword — meaning the AI fleet was
+expensive plumbing that almost never ran.
 
 ---
 
@@ -133,9 +141,14 @@ This:
 
 | Service | Files per worker | Max replicas |
 | --- | --- | --- |
-| `rules-worker` (also drains `ocr`) | 100 | 2 |
-| `ai-small-worker` | 50 | 2 |
-| `ai-large-worker` | 20 | 1 |
+| `ai-small-worker` | 25 | 2 |
+| `ai-large-worker` | 10 | 1 |
+
+Only AI workers are Compose services in the AI-first architecture —
+rules run as a fallback inside each AI worker, so a separate
+rules-worker container would be redundant. OCR-routed files (images)
+are flagged Unknown on the dispatcher until a real OCR classifier
+ships.
 
 The table lives in `main.py:COMPOSE_SCALE` — change the numbers to match your hardware.
 
@@ -296,7 +309,7 @@ Categories live in `config/categories.yaml`. Adding a new classification source 
 
 | Setting | Purpose |
 | --- | --- |
-| `confidence_threshold` | Minimum AI confidence (0–100) before AI's answer is accepted. |
+| `confidence_threshold` | Minimum AI confidence (0–100) before AI's answer wins; below this the file falls through to the rules safety net. **60** is a good fit for 7B models (which self-report 60–75 even when right); raise to 80+ for 14B / 32B models which are more confident. |
 | `max_extract_chars` | Upper bound on characters extracted per file before the LLM sees it. |
 | `models.<route>` | **Per-route model** — what each AI worker actually loads (e.g. `models.ai-small: qwen2.5:7b`). |
 | `default_local_model` | Legacy fallback used by the inline `smartsort run` path and as the default for `ai-small` if `models.ai-small` is unset. |

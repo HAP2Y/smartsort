@@ -7,7 +7,7 @@ from inference.router import (
     ROUTE_AI_LARGE,
     ROUTE_AI_SMALL,
     ROUTE_OCR,
-    ROUTE_RULES,
+    ROUTE_UNROUTABLE,
     Router,
 )
 
@@ -32,9 +32,12 @@ def test_default_router_sends_images_to_ocr(tmp_path):
     assert Router.default().route(f) == ROUTE_OCR
 
 
-def test_default_router_falls_back_to_rules(tmp_path):
+def test_default_router_falls_back_to_unroutable(tmp_path):
+    """Files with no matching rule must fall through to UNROUTABLE so the
+    dispatcher can classify them Unknown locally rather than enqueuing
+    work nobody will drain."""
     f = _make(tmp_path / "binary.bin", size=2048)
-    assert Router.default().route(f) == ROUTE_RULES
+    assert Router.default().route(f) == ROUTE_UNROUTABLE
 
 
 def test_router_handles_missing_file_via_safe_size(tmp_path):
@@ -58,5 +61,6 @@ def test_describe_routes_reports_every_rule_plus_default():
     assert ROUTE_OCR in routes_listed
     assert ROUTE_AI_LARGE in routes_listed
     assert ROUTE_AI_SMALL in routes_listed
-    assert routes_listed[-1] == ROUTE_RULES  # fallback comes last
+    # Default (last) entry is UNROUTABLE in the new architecture.
+    assert routes_listed[-1] == ROUTE_UNROUTABLE
     assert all(isinstance(note, str) for _, note in summary)

@@ -185,8 +185,13 @@ categories:
     keywords: []
 
 settings:
-  confidence_threshold: 80
-  max_extract_chars: 1000
+  # AI is the primary classifier in distributed mode — workers run
+  # AI -> HC-rules -> fallback-rules. The threshold below is what the
+  # AI's answer must clear to short-circuit the rules safety net. 60 is
+  # a good fit for 7B models (which tend to self-report 60-75 even when
+  # right); raise to 80+ for 14B / 32B models which are more confident.
+  confidence_threshold: 60
+  max_extract_chars: 1500
 
   # Per-route Ollama model selection.
   #

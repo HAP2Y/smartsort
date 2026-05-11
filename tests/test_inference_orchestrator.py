@@ -14,7 +14,7 @@ from inference.router import (
     ROUTE_AI_LARGE,
     ROUTE_AI_SMALL,
     ROUTE_OCR,
-    ROUTE_RULES,
+    ROUTE_UNROUTABLE,
     RouteRule,
 )
 
@@ -62,7 +62,7 @@ def test_orchestrator_round_trip(tmp_path):
 
     backend = InMemoryQueueBackend()
     workers = _spin_workers(backend, {
-        ROUTE_RULES: "rules-stub",
+        ROUTE_UNROUTABLE: "rules-stub",
         ROUTE_AI_SMALL: "ai-small-stub",
         ROUTE_AI_LARGE: "ai-large-stub",
         ROUTE_OCR: "ocr-stub",
@@ -75,7 +75,7 @@ def test_orchestrator_round_trip(tmp_path):
     assert orchestrator.stats.by_route[ROUTE_AI_SMALL] == 1
     assert orchestrator.stats.by_route[ROUTE_AI_LARGE] == 1
     assert orchestrator.stats.by_route[ROUTE_OCR] == 1
-    assert orchestrator.stats.by_route[ROUTE_RULES] == 1
+    assert orchestrator.stats.by_route[ROUTE_UNROUTABLE] == 1
 
     plan = orchestrator.collect(pending, timeout=5.0, poll=0.1)
 
@@ -127,7 +127,7 @@ def test_orchestrator_invokes_on_result_callback(tmp_path):
 
     backend = InMemoryQueueBackend()
     workers = _spin_workers(backend, {
-        ROUTE_RULES: "rules", ROUTE_AI_SMALL: "small",
+        ROUTE_UNROUTABLE: "rules", ROUTE_AI_SMALL: "small",
         ROUTE_AI_LARGE: "large", ROUTE_OCR: "ocr",
     })
 
@@ -163,7 +163,7 @@ def test_orchestrator_ignores_stray_results(tmp_path):
         classification={"category": "Foo", "confidence": 99, "method": "X", "reason": "y"},
     ))
 
-    workers = _spin_workers(backend, {ROUTE_RULES: "rules"})
+    workers = _spin_workers(backend, {ROUTE_UNROUTABLE: "rules"})
     orchestrator = Orchestrator(backend=backend, router=Router.default())
     pending = orchestrator.submit([f])
     plan = orchestrator.collect(pending, timeout=5.0, poll=0.1)
@@ -192,9 +192,9 @@ def test_orchestrator_handles_malformed_classification(tmp_path):
     backend = InMemoryQueueBackend()
     # Run the worker manually and corrupt the published result.
     from inference.types import Job, JobResult
-    job = Job(file_path=str(f), route=ROUTE_RULES)
+    job = Job(file_path=str(f), route=ROUTE_UNROUTABLE)
     backend.publish_result(JobResult(
-        job_id=job.id, file_path=str(f), route=ROUTE_RULES,
+        job_id=job.id, file_path=str(f), route=ROUTE_UNROUTABLE,
         worker_id="w", duration_ms=1.0,
         classification={"missing_fields": True},
     ))
@@ -213,9 +213,9 @@ def test_orchestrator_handles_worker_error_field(tmp_path):
 
     from inference.types import Job, JobResult
     backend = InMemoryQueueBackend()
-    job = Job(file_path=str(f), route=ROUTE_RULES)
+    job = Job(file_path=str(f), route=ROUTE_UNROUTABLE)
     backend.publish_result(JobResult(
-        job_id=job.id, file_path=str(f), route=ROUTE_RULES,
+        job_id=job.id, file_path=str(f), route=ROUTE_UNROUTABLE,
         worker_id="w", duration_ms=1.0, error="RuntimeError: boom",
     ))
 
@@ -242,7 +242,7 @@ def test_orchestrator_by_route_stats_track_each_queue(tmp_path):
 
     assert orchestrator.stats.submitted == 4
     assert orchestrator.stats.by_route == {
-        ROUTE_AI_SMALL: 1, ROUTE_AI_LARGE: 1, ROUTE_OCR: 1, ROUTE_RULES: 1,
+        ROUTE_AI_SMALL: 1, ROUTE_AI_LARGE: 1, ROUTE_OCR: 1, ROUTE_UNROUTABLE: 1,
     }
 
 

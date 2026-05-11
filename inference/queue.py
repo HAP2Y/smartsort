@@ -129,7 +129,19 @@ class RedisStreamBackend:
                 "redis backend requires the 'redis' package: pip install redis"
             ) from exc
 
-        self._redis = redis.Redis.from_url(url, decode_responses=True)
+        # Long-running workers sit idle on XREADGROUP for hours. Without
+        # TCP keepalive a NAT / firewall in between can silently drop the
+        # connection, leaving the worker blocked forever on a dead socket
+        # while Redis still happily lists it as a consumer. Enable OS-level
+        # keepalive and let redis-py's health-check probe surface dead
+        # connections so the next call reconnects automatically.
+        self._redis = redis.Redis.from_url(
+            url,
+            decode_responses=True,
+            socket_keepalive=True,
+            health_check_interval=30,
+            retry_on_timeout=True,
+        )
         self._consumer = consumer_name or f"c-{int(time.time()*1000)}"
         self._group = group
         self._stream_prefix = stream_prefix
