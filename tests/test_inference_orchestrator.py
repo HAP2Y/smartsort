@@ -119,3 +119,138 @@ def test_router_rules_are_first_match(tmp_path):
         ]
     )
     assert router.route(FileItem(path=f)) == "first"
+
+
+def test_orchestrator_invokes_on_result_callback(tmp_path):
+    f1 = tmp_path / "a.pdf"; f1.write_bytes(b"x")
+    f2 = tmp_path / "b.bin"; f2.write_bytes(b"x")
+
+    backend = InMemoryQueueBackend()
+    workers = _spin_workers(backend, {
+        ROUTE_RULES: "rules", ROUTE_AI_SMALL: "small",
+        ROUTE_AI_LARGE: "large", ROUTE_OCR: "ocr",
+    })
+
+    seen: list = []
+    def cb(result, classification):
+        seen.append((result.file_path, classification.category))
+
+    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    pending = orchestrator.submit([f1, f2])
+    orchestrator.collect(pending, timeout=5.0, poll=0.1, on_result=cb)
+
+    assert len(seen) == 2
+    assert {p for p, _ in seen} == {str(f1), str(f2)}
+
+    for w in workers: w.stop()
+
+
+def test_orchestrator_ignores_stray_results(tmp_path):
+    """Results for unknown job_ids (e.g. a previous run on a shared Redis
+    stream) must be silently skipped, not crash the collector."""
+    # .bin lands on the rules route via the default router fallback.
+    f = tmp_path / "a.bin"; f.write_bytes(b"x")
+
+    backend = InMemoryQueueBackend()
+    # Publish a stray result before any job is submitted.
+    from inference.types import JobResult
+    backend.publish_result(JobResult(
+        job_id="stray-id-from-prior-run",
+        file_path="/tmp/old.pdf",
+        route="rules",
+        worker_id="ghost",
+        duration_ms=1.0,
+        classification={"category": "Foo", "confidence": 99, "method": "X", "reason": "y"},
+    ))
+
+    workers = _spin_workers(backend, {ROUTE_RULES: "rules"})
+    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    pending = orchestrator.submit([f])
+    plan = orchestrator.collect(pending, timeout=5.0, poll=0.1)
+
+    assert str(f) in plan
+    assert plan[str(f)].is_known
+    # The stray result must not have been counted as a completion.
+    assert orchestrator.stats.completed == 1
+
+    for w in workers: w.stop()
+
+
+def test_orchestrator_handles_malformed_classification(tmp_path):
+    """If a worker publishes a result with a classification dict missing
+    required fields, the orchestrator falls back to Unknown_Unsorted rather
+    than crashing the whole run."""
+    f = tmp_path / "a.pdf"; f.write_bytes(b"x")
+
+    class BadClassifier:
+        name = "bad"
+        def classify(self, file: FileItem):
+            # Return a Classification with a category our fallback parser
+            # can't reconstruct (we'll fake it by post-processing the result).
+            return Classification(category="Travel_Transit", confidence=90, method="bad", reason="r")
+
+    backend = InMemoryQueueBackend()
+    # Run the worker manually and corrupt the published result.
+    from inference.types import Job, JobResult
+    job = Job(file_path=str(f), route=ROUTE_RULES)
+    backend.publish_result(JobResult(
+        job_id=job.id, file_path=str(f), route=ROUTE_RULES,
+        worker_id="w", duration_ms=1.0,
+        classification={"missing_fields": True},
+    ))
+
+    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    # Inject the pending job directly so collect() has the expected id.
+    pending = {job.id: job}
+    plan = orchestrator.collect(pending, timeout=2.0, poll=0.1)
+
+    assert plan[str(f)].category == "Unknown_Unsorted"
+    assert "malformed" in plan[str(f)].reason
+
+
+def test_orchestrator_handles_worker_error_field(tmp_path):
+    f = tmp_path / "a.pdf"; f.write_bytes(b"x")
+
+    from inference.types import Job, JobResult
+    backend = InMemoryQueueBackend()
+    job = Job(file_path=str(f), route=ROUTE_RULES)
+    backend.publish_result(JobResult(
+        job_id=job.id, file_path=str(f), route=ROUTE_RULES,
+        worker_id="w", duration_ms=1.0, error="RuntimeError: boom",
+    ))
+
+    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    plan = orchestrator.collect({job.id: job}, timeout=2.0, poll=0.1)
+
+    assert plan[str(f)].category == "Unknown_Unsorted"
+    assert "worker error" in plan[str(f)].reason
+    assert "boom" in plan[str(f)].reason
+    assert orchestrator.stats.failed == 1
+
+
+def test_orchestrator_by_route_stats_track_each_queue(tmp_path):
+    files = []
+    for name, size in [("small.pdf", 1024), ("big.pdf", 3 * 1024 * 1024),
+                       ("img.png", 1024), ("misc.bin", 1024)]:
+        p = tmp_path / name
+        p.write_bytes(b"x" * size)
+        files.append(p)
+
+    backend = InMemoryQueueBackend()
+    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    orchestrator.submit(files)
+
+    assert orchestrator.stats.submitted == 4
+    assert orchestrator.stats.by_route == {
+        ROUTE_AI_SMALL: 1, ROUTE_AI_LARGE: 1, ROUTE_OCR: 1, ROUTE_RULES: 1,
+    }
+
+
+def test_orchestrator_submit_with_empty_files_is_a_noop():
+    backend = InMemoryQueueBackend()
+    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    pending = orchestrator.submit([])
+
+    assert pending == {}
+    assert orchestrator.stats.submitted == 0
+    assert orchestrator.stats.by_route == {}

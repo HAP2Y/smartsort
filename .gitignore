@@ -65,3 +65,5 @@ bin/
 # =========================
 .smartsort_undo.json
 .pytest_cache/
+.coverage
+htmlcov/

@@ -63,3 +63,101 @@ def test_worker_publishes_classification(tmp_path):
     assert res.classification["category"] == "Travel_Transit"
     assert res.duration_ms >= 0
     assert w.stats.processed == 1
+
+
+class NoneClassifier:
+    """Classifier that declines to classify (returns None)."""
+    name = "none"
+    def classify(self, file: FileItem):
+        return None
+
+
+def test_worker_publishes_empty_result_when_classifier_returns_none(tmp_path):
+    """A None return is not an error — it just means nothing to report.
+
+    The orchestrator will treat the absent classification as Unknown_Unsorted.
+    """
+    f = tmp_path / "a.pdf"
+    f.write_bytes(b"x")
+    backend = InMemoryQueueBackend()
+    w = Worker(name="w", routes=["rules"], classifier=NoneClassifier(), backend=backend, poll_timeout=0.1)
+    t = _drive(w)
+
+    backend.enqueue(Job(file_path=str(f), route="rules"))
+    res = backend.consume_result(timeout=2.0)
+    w.stop()
+    t.join(timeout=2.0)
+
+    assert res is not None
+    assert res.error is None
+    assert res.classification is None
+    # ok is False because classification is None, but no exception was raised.
+    assert w.stats.processed == 1  # counted as processed (no error)
+    assert w.stats.failed == 0
+
+
+def test_worker_stats_accumulate_across_jobs(tmp_path):
+    f = tmp_path / "a.pdf"
+    f.write_bytes(b"x")
+    backend = InMemoryQueueBackend()
+    w = Worker(name="w", routes=["rules"], classifier=OkClassifier(), backend=backend, poll_timeout=0.1)
+    t = _drive(w)
+
+    for _ in range(5):
+        backend.enqueue(Job(file_path=str(f), route="rules"))
+
+    seen = 0
+    while seen < 5:
+        if backend.consume_result(timeout=2.0) is not None:
+            seen += 1
+
+    w.stop()
+    t.join(timeout=2.0)
+
+    assert w.stats.processed == 5
+    assert w.stats.failed == 0
+    assert w.stats.total_duration_ms >= 0
+
+
+def test_worker_subscribed_to_multiple_routes_drains_all(tmp_path):
+    f = tmp_path / "a.pdf"
+    f.write_bytes(b"x")
+    backend = InMemoryQueueBackend()
+    w = Worker(
+        name="w-multi", routes=["rules", "ocr"],
+        classifier=OkClassifier(), backend=backend, poll_timeout=0.1,
+    )
+    t = _drive(w)
+
+    backend.enqueue(Job(file_path=str(f), route="rules"))
+    backend.enqueue(Job(file_path=str(f), route="ocr"))
+
+    seen_routes = set()
+    for _ in range(2):
+        res = backend.consume_result(timeout=2.0)
+        assert res is not None
+        seen_routes.add(res.route)
+
+    w.stop()
+    t.join(timeout=2.0)
+
+    assert seen_routes == {"rules", "ocr"}
+    assert w.stats.processed == 2
+
+
+def test_worker_stop_unblocks_run_loop():
+    """stop() before any jobs arrive must let run() return promptly."""
+    import time
+    backend = InMemoryQueueBackend()
+    w = Worker(
+        name="w-stop", routes=["rules"],
+        classifier=OkClassifier(), backend=backend, poll_timeout=0.1,
+    )
+    t = _drive(w)
+
+    time.sleep(0.2)
+    w.stop()
+    t.join(timeout=2.0)
+
+    assert not t.is_alive()
+    assert w.stats.processed == 0

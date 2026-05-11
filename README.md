@@ -16,7 +16,7 @@ The platform is workload-agnostic. File classification is the reference implemen
 - **Workload-aware autoscaling** — the dispatcher pre-routes the file set locally, sizes the Compose fleet to match (more `ai-small` replicas when there are lots of small PDFs, more `ai-large` when there are big ones), and brings it up in one command.
 - **Fault isolation across the queue boundary** — a crashing worker reports the exception as a `JobResult.error` instead of poisoning the queue; the orchestrator fills timeouts with `Unknown_Unsorted` so the end-user always receives a complete plan.
 - **Container-ready scale path** — Dockerfile + Compose stack with Redis, per-route worker pools, and an on-demand dispatcher. `docker-compose up --scale ai-small-worker=4` is the entire horizontal scale story; the same image is the building block for a Kubernetes Deployment.
-- **127 tests, fully offline** — the network is mocked end-to-end. CI runs the same suite plus an out-of-process CLI smoke test.
+- **157 tests, fully offline** — the network is mocked end-to-end. CI runs the same suite plus an out-of-process CLI smoke test.
 
 ---
 
@@ -160,6 +160,44 @@ A single worker can subscribe to multiple routes — above, one cheap process dr
 
 ---
 
+## Why Redis (and how it scales)
+
+The Redis backend is the production-style story. It's deliberately built on **Redis Streams + consumer groups** rather than plain lists or pub/sub, because that combination gives every property the platform actually needs:
+
+| Property | How it's realised | Why it matters |
+| --- | --- | --- |
+| **At-least-once delivery** | `XREADGROUP` reserves an entry in the consumer's Pending Entries List until it's acked with `XACK`. | A crashing worker doesn't silently drop the job — the entry is still claimable from PEL. |
+| **Exactly-once-per-group** | One consumer group per worker pool means each job is delivered to *one* consumer in the group, regardless of how many workers join. | Scale out by adding more workers to the same group; no coordination layer required. |
+| **Horizontal scaling** | `docker-compose up --scale ai-small-worker=N` (or `kubectl scale deploy ai-small-worker --replicas=N`). | Throughput on the AI route grows linearly with worker count until you saturate Ollama or the GPU. |
+| **Workload-aware autoscaling** | `smartsort run --up` pre-routes files locally and sizes the fleet via `--scale svc=N` per route before submitting. | Cold-start cost is paid once; the next dispatch is instant. |
+| **Stateless dispatcher** | `smartsort run` writes only to Redis and reads only from the result stream. No local state survives the process. | Fire it from your laptop, from CI, from a cron pod — wherever can reach Redis. |
+| **Backpressure observability** | `redis-cli XLEN smartsort:jobs:<route>` returns the queue depth at any instant. | Hook the autoscaler / a dashboard up to queue depth instead of CPU. |
+| **Pluggable backend** | Workers, router, and orchestrator depend only on the `QueueBackend` protocol; the Redis implementation is one of two ships today. | Swap to Kafka / NATS / SQS / RabbitMQ by writing one class. Application code is untouched. |
+| **Cross-host portability** | Workers don't bind to localhost; they speak only to `REDIS_URL`. The Compose image is the same artefact you'd push to a Kubernetes Deployment. | The path from "one laptop" to "GPU node pool in a cluster" is configuration, not refactoring. |
+
+### Throughput model
+
+For a workload of *N* files split across queues:
+
+```
+wall_time ≈ max(
+    queue_depth(rules)     / (workers_rules    × throughput_rules),
+    queue_depth(ai-small)  / (workers_ai-small × throughput_ai-small),
+    queue_depth(ai-large)  / (workers_ai-large × throughput_ai-large),
+    queue_depth(ocr)       / (workers_ocr      × throughput_ocr),
+)
+```
+
+The router rebalances the numerator across queues; horizontal scaling rebalances the denominator. The system is throughput-bound by Ollama (per-token latency on AI routes) and disk (filename rules), not by Redis itself — a single Redis instance comfortably handles tens of thousands of stream entries per second, well above any plausible Ollama saturation point.
+
+### What this enables next
+
+- Drop a GPU-only worker pool on a separate host pointing at the same Redis URL — the AI routes seamlessly fan out to it.
+- Add a different workload (audio transcription, embedding generation, OCR for real) as a new route + worker without touching anything that already works.
+- A Kubernetes HorizontalPodAutoscaler keyed off `XLEN` per route gives true reactive autoscaling — the structure is already there, the manifests are the only missing piece.
+
+---
+
 ## How classification works
 
 Each worker hosts a `ClassificationPipeline`. The first confident result wins:
@@ -206,7 +244,7 @@ config/categories.yaml
 Dockerfile
 docker-compose.yml         # redis + per-route worker pools + on-demand cli
 main.py                    # run, undo, check-rules, serve-worker
-tests/                     # 127 tests, all offline
+tests/                     # 157 tests, all offline
 ```
 
 ---
@@ -217,7 +255,7 @@ tests/                     # 127 tests, all offline
 python -m pytest tests/ -q
 ```
 
-127 tests covering the rules engine, the `Classification` pipeline, the Ollama client (network mocked), text extraction, PII redaction, organizer move + undo round-trips, an end-to-end CLI dry-run, plus the distributed-inference layer: queue round-trips, router decisions, worker exception capture, and an end-to-end orchestrator run with stub workers.
+157 tests covering the rules engine, the `Classification` pipeline, the Ollama client (network mocked), text extraction, PII redaction, organizer move + undo round-trips, an end-to-end CLI dry-run, plus the distributed-inference layer: queue round-trips, router decisions, worker exception capture, and an end-to-end orchestrator run with stub workers.
 
 CI runs the same suite plus an out-of-process CLI smoke test (`.github/workflows/ci.yml`).
 
@@ -244,4 +282,4 @@ CI runs the same suite plus an out-of-process CLI smoke test (`.github/workflows
 
 ## License
 
-MIT. See `pyproject.toml`.
+MIT — see [`LICENSE`](LICENSE).
