@@ -1,14 +1,14 @@
 # Local development stack for the distributed inference runtime.
 #
 # Usage:
-#   docker compose up --build              # start redis + one worker per route
-#   docker compose up --scale ai-small-worker=4   # scale a route horizontally
+#   docker-compose up --build              # start redis + one worker per route
+#   docker-compose up --scale ai-small-worker=4   # scale a route horizontally
 #
 # To submit work from your host machine (workers stay running here):
 #   smartsort run ./workdir --distributed --backend redis --redis-url redis://localhost:6379/0
 #
 # Or run the dispatcher inside the network:
-#   docker compose run --rm cli run /work --distributed --backend redis \
+#   docker-compose run --rm cli run /work --distributed --backend redis \
 #                                  --redis-url redis://redis:6379/0
 #
 # Linux note: AI workers reach Ollama via host.docker.internal. The
@@ -80,7 +80,7 @@ services:
       - -v
 
   # On-demand CLI for running `smartsort run ...` inside the compose network.
-  # Started only via `docker compose run --rm cli ...`, never on `up`.
+  # Started only via `docker-compose run --rm cli ...`, never on `up`.
   cli:
     <<: *worker-base
     profiles: ["cli"]

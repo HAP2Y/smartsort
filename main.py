@@ -130,6 +130,15 @@ def run(
         300.0, "--timeout",
         help="Max seconds to wait for distributed results before filling Unknown_Unsorted.",
     ),
+    up: bool = typer.Option(
+        False, "--up",
+        help="With --backend=redis, run `docker compose up -d --build` first to start the worker fleet, "
+             "then dispatch. Workers are left running afterward for reuse.",
+    ),
+    down: bool = typer.Option(
+        False, "--down",
+        help="After dispatching, run `docker compose down` to tear the fleet back down.",
+    ),
     verbose: int = typer.Option(0, "--verbose", "-v", count=True, help="Increase verbosity (-v, -vv)."),
 ):
     """Sort files in TARGET_DIR.
@@ -156,27 +165,60 @@ def run(
         console.print("[yellow]Nothing to do.[/yellow]")
         return
 
-    if distributed:
-        plan = _run_distributed(
-            files=files,
-            config=config,
-            backend=backend,
-            redis_url=redis_url,
-            workers=workers,
-            timeout=timeout,
+    if (up or down) and not (distributed and backend == "redis"):
+        console.print(
+            "[yellow]--up/--down only apply with --distributed --backend redis; ignoring.[/yellow]"
         )
-    else:
-        plan = _run_local(files=files, config=config, no_ai=no_ai)
+        up = False
+        down = False
 
-    _print_plan(plan, apply)
+    brought_up = False
+    if up:
+        # Pre-route locally to size the fleet for the actual workload.
+        # Router.route() is pure (filename + size only), so doing it here and
+        # again inside the orchestrator is cheap and avoids leaking router
+        # internals into _compose_up.
+        counts = _route_counts(files, Router.default())
+        targets = _scale_targets(counts)
+        console.print(
+            "[dim]Route counts: "
+            + ", ".join(f"{r}={n}" for r, n in sorted(counts.items()))
+            + "[/dim]"
+        )
+        brought_up = _compose_up(scale=targets)
+        if not brought_up:
+            raise typer.Exit(1)
 
-    if apply:
-        organizer = Organizer(str(target), category_names=categories)
-        organizer.move_files({fp: c.to_dict() for fp, c in plan.items()}, apply=True)
-        console.print(f"[bold green]\nFiles sorted. Undo log: {organizer.undo_log}[/bold green]")
-        console.print("[dim]Run `smartsort undo <dir>` to revert.[/dim]")
-    else:
-        console.print("\n[yellow]Dry-run complete. Run with --apply to move files.[/yellow]")
+    try:
+        if distributed:
+            plan = _run_distributed(
+                files=files,
+                config=config,
+                backend=backend,
+                redis_url=redis_url,
+                workers=workers,
+                timeout=timeout,
+            )
+        else:
+            plan = _run_local(files=files, config=config, no_ai=no_ai)
+
+        _print_plan(plan, apply)
+
+        if apply:
+            organizer = Organizer(str(target), category_names=categories)
+            organizer.move_files({fp: c.to_dict() for fp, c in plan.items()}, apply=True)
+            console.print(f"[bold green]\nFiles sorted. Undo log: {organizer.undo_log}[/bold green]")
+            console.print("[dim]Run `smartsort undo <dir>` to revert.[/dim]")
+        else:
+            console.print("\n[yellow]Dry-run complete. Run with --apply to move files.[/yellow]")
+    finally:
+        if down and brought_up:
+            _compose_down()
+        elif brought_up and not down:
+            console.print(
+                "[dim]Worker fleet left running. "
+                "Stop it with `docker compose down` or re-run with --down.[/dim]"
+            )
 
 
 def _run_local(*, files: list[Path], config: dict, no_ai: bool) -> dict[str, Classification]:
@@ -191,6 +233,117 @@ def _run_local(*, files: list[Path], config: dict, no_ai: bool) -> dict[str, Cla
             status.update(f"[bold green]Classifying: {path.name}")
             plan[str(path)] = pipeline.classify(FileItem(path=path))
     return plan
+
+
+# --------------------------------------------------- compose lifecycle
+
+
+# Per-route scale tuning. files_per_worker is the "soft saturation" point —
+# above it we add another worker. max_workers caps the autoscaler so a
+# directory of 10k files doesn't try to spawn 400 containers.
+#
+# rules-worker subscribes to both `rules` and `ocr`, so its scaling target
+# combines the two route counts.
+COMPOSE_SCALE = {
+    "rules-worker":    {"files_per_worker": 100, "max_workers": 2},
+    "ai-small-worker": {"files_per_worker": 25,  "max_workers": 6},
+    "ai-large-worker": {"files_per_worker": 10,  "max_workers": 3},
+}
+
+
+def _compose_cmd() -> list[str] | None:
+    """Return the docker-compose invocation that works on this host, or None."""
+    import shutil
+    if shutil.which("docker"):
+        # docker compose (v2 plugin) is the modern form; docker-compose (v1)
+        # is the legacy binary. We'll prefer v2 and fall back to v1.
+        import subprocess
+        probe = subprocess.run(
+            ["docker", "compose", "version"],
+            capture_output=True, text=True,
+        )
+        if probe.returncode == 0:
+            return ["docker", "compose"]
+    if shutil.which("docker-compose"):
+        return ["docker-compose"]
+    return None
+
+
+def _route_counts(files: list[Path], router: Router) -> dict[str, int]:
+    """Pure pre-pass: ask the router where each file would go, without enqueuing."""
+    counts: dict[str, int] = {}
+    for path in files:
+        route = router.route(FileItem(path=path))
+        counts[route] = counts.get(route, 0) + 1
+    return counts
+
+
+def _scale_targets(counts: dict[str, int]) -> dict[str, int]:
+    """Map compose service -> desired replicas, sized for the workload."""
+    import math
+    # rules-worker handles both rules and ocr queues (see docker-compose.yml).
+    rules_total = counts.get(ROUTE_RULES, 0) + counts.get(ROUTE_OCR, 0)
+    ai_small    = counts.get(ROUTE_AI_SMALL, 0)
+    ai_large    = counts.get(ROUTE_AI_LARGE, 0)
+
+    def _scale(jobs: int, cfg: dict) -> int:
+        if jobs <= 0:
+            return 1  # keep one warm worker in case stray jobs land
+        return min(cfg["max_workers"], max(1, math.ceil(jobs / cfg["files_per_worker"])))
+
+    return {
+        "rules-worker":    _scale(rules_total, COMPOSE_SCALE["rules-worker"]),
+        "ai-small-worker": _scale(ai_small,    COMPOSE_SCALE["ai-small-worker"]),
+        "ai-large-worker": _scale(ai_large,    COMPOSE_SCALE["ai-large-worker"]),
+    }
+
+
+def _compose_up(scale: dict[str, int] | None = None) -> bool:
+    """Start the worker fleet via `docker compose up -d --build`.
+
+    Returns True on success. Honours `scale` by passing `--scale svc=N` for
+    each service so the fleet is sized to the workload from the start.
+    """
+    import subprocess
+    base = _compose_cmd()
+    if base is None:
+        console.print("[red]--up requires docker (compose v2) or docker-compose on PATH.[/red]")
+        return False
+    if not Path("docker-compose.yml").exists():
+        console.print("[red]--up needs docker-compose.yml in the current directory.[/red]")
+        return False
+
+    cmd = base + ["up", "-d", "--build"]
+    if scale:
+        for service, n in scale.items():
+            cmd += ["--scale", f"{service}={n}"]
+        scale_summary = ", ".join(f"{s}={n}" for s, n in scale.items())
+        console.print(f"[bold cyan]Bringing fleet up: {scale_summary}[/bold cyan]")
+    else:
+        console.print("[bold cyan]Bringing fleet up...[/bold cyan]")
+
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        console.print("[red]docker compose up failed; see output above.[/red]")
+        return False
+
+    # Workers subscribe to Redis on startup; give them a beat so the first
+    # XADD doesn't land before any consumer has joined the group.
+    import time
+    time.sleep(2)
+    return True
+
+
+def _compose_down() -> None:
+    import subprocess
+    base = _compose_cmd()
+    if base is None:
+        return
+    console.print("[bold cyan]Tearing fleet down...[/bold cyan]")
+    subprocess.run(base + ["down"])
+
+
+# --------------------------------------------------- distributed runner
 
 
 def _run_distributed(
