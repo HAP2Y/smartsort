@@ -154,6 +154,167 @@ Each `--apply` writes a `.smartsort_undo.json` log into the target directory. `u
 
 ---
 
+## End-to-end walkthrough on `~/Downloads`
+
+A staged path that exercises the single-process pipeline first, then the in-memory distributed runtime, then the full Redis-backed worker fleet. Stop at whichever level of testing you need.
+
+### 0. Preflight (one-time)
+
+```bash
+git fetch origin
+git checkout claude/distributed-inference-platform-jgYrc
+git pull
+
+pip install -e ".[dev]"
+pip install redis                       # only needed for the Redis backend
+
+ollama pull qwen2.5:14b                 # default model for the ai-small route
+ollama serve &                          # if it isn't already running
+
+smartsort check-rules                   # sanity check categories.yaml
+python -m pytest tests/ -q              # expect: 127 passed
+```
+
+### 1. Always start on a copy
+
+The tool is idempotent and ships with `undo`, but the first run on `~/Downloads` is safer against a sandbox copy:
+
+```bash
+mkdir -p ~/smartsort-sandbox
+cp -R ~/Downloads/* ~/smartsort-sandbox/
+```
+
+Use `~/smartsort-sandbox` as the target until you trust the plan, then point the same commands at `~/Downloads`.
+
+### 2. Single-process baseline
+
+Confirms config + Ollama are wired correctly before involving the queue layer.
+
+```bash
+smartsort run ~/smartsort-sandbox --no-ai          # rules-only dry-run
+smartsort run ~/smartsort-sandbox -vv              # full pipeline, dry-run, debug logs
+```
+
+Expect a "Classification Plan" table. Nothing has moved yet.
+
+### 3. Distributed runtime, no Redis (in-process workers)
+
+Cheapest exercise of the new code path: orchestrator and workers share one process via the in-memory backend.
+
+```bash
+smartsort dispatch ~/smartsort-sandbox \
+    --backend memory \
+    --inline-workers 2 \
+    --timeout 120 \
+    -vv
+```
+
+Look for:
+
+- A "Routing plan" table listing the four routes (`ocr`, `ai-large`, `ai-small`, `rules`).
+- A "Submitted N jobs" line broken down per route — the router fanning files out.
+- A "Classification Plan" table identical in shape to the single-process one.
+- `submitted=N completed=N failed=0` — the orchestrator confirming every job round-tripped through the queue.
+
+If `failed > 0`, re-run with `-vv` to see which worker errored on which file.
+
+### 4. Distributed runtime, real Redis (separate processes)
+
+Three terminals (or one terminal + `tmux`).
+
+#### 4a. Start Redis
+
+```bash
+docker run --rm -p 6379:6379 --name smartsort-redis redis:7-alpine
+# or, locally: redis-server
+```
+
+#### 4b. One worker per route
+
+```bash
+# terminal 1
+smartsort serve-worker --route rules    --backend redis --redis-url redis://localhost:6379/0 -v
+
+# terminal 2
+smartsort serve-worker --route ai-small --backend redis --redis-url redis://localhost:6379/0 -v
+
+# terminal 3 (optional, if you have a larger model pulled)
+smartsort serve-worker --route ai-large --backend redis --redis-url redis://localhost:6379/0 \
+    --model qwen2.5:32b -v
+```
+
+Each prints `Worker <name> listening on route '<r>' via redis.` and then sits idle.
+
+#### 4c. Dispatch from a fourth terminal
+
+```bash
+smartsort dispatch ~/smartsort-sandbox \
+    --backend redis --redis-url redis://localhost:6379/0 \
+    --timeout 300 -vv
+```
+
+Jobs land on the worker terminals (`-v` makes each worker log its `processed` / `failed` counters). Workers print final stats on `Ctrl-C` shutdown.
+
+#### 4d. Scale test — proves throughput actually scales
+
+Kill the single `ai-small` worker and start two named instances:
+
+```bash
+smartsort serve-worker --route ai-small --backend redis --name ai-small-1
+smartsort serve-worker --route ai-small --backend redis --name ai-small-2
+```
+
+Re-run the dispatch. Total wall time drops, and each worker's `processed` count is roughly half of what one worker reported alone.
+
+### 5. Same flow under Docker Compose (one command)
+
+```bash
+mkdir -p workdir
+cp -R ~/smartsort-sandbox/* workdir/
+
+docker compose up --build              # redis + 1 worker per route
+# in another terminal:
+docker compose run --rm dispatcher dispatch /work \
+    --backend redis --redis-url redis://redis:6379/0 \
+    --timeout 300 -vv
+
+# horizontal scale demo:
+docker compose up --scale ai-small-worker=4 -d
+```
+
+The AI workers in compose target `host.docker.internal:11434`, which works on Docker Desktop (Mac/Windows) by default. On Linux, either run Ollama in a sibling container or add `--add-host=host.docker.internal:host-gateway` to the worker services.
+
+### 6. Apply for real, then undo
+
+Once the dry-run plan looks right:
+
+```bash
+smartsort dispatch ~/smartsort-sandbox \
+    --backend redis --redis-url redis://localhost:6379/0 \
+    --apply
+```
+
+Files move into category subfolders and a `.smartsort_undo.json` log is written into the target directory. To revert:
+
+```bash
+smartsort undo ~/smartsort-sandbox
+```
+
+Once you trust the output, repeat steps 3–6 against `~/Downloads` directly.
+
+### Useful debugging flags
+
+| Flag | Effect |
+| --- | --- |
+| `-v` / `-vv` | INFO / DEBUG logging on either command |
+| `--timeout 600` | extend the dispatcher's wait window for big directories |
+| `--no-ai` | skip Ollama entirely (only valid on `smartsort run`, not `dispatch`) |
+| `--inline-workers 0` | dispatch with zero workers — proves the orchestrator times out cleanly and fills with `Unknown_Unsorted` instead of hanging |
+
+Fastest single-command diagnostic for a misbehaving directory: `smartsort dispatch <dir> --backend memory --inline-workers 1 -vv` — single thread, full debug logs, no network.
+
+---
+
 ## Settings reference
 
 | Setting | Purpose |
