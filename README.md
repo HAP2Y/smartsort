@@ -80,7 +80,7 @@ Two steps: start the worker fleet, then submit work. Workers stay running across
 
 ```bash
 # 1. Start Redis + one worker per route, in the background.
-docker compose up --build -d
+docker-compose up --build -d
 
 # 2. From your host, submit a directory. Workers in containers pick the jobs up.
 smartsort run ~/Downloads --distributed --backend redis \
