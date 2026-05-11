@@ -26,7 +26,6 @@ from inference.router import (
     ROUTE_AI_SMALL,
     ROUTE_OCR,
     ROUTE_RULES,
-    describe_routes,
 )
 from movers.organizer import Organizer
 
@@ -111,9 +110,36 @@ def run(
     apply: bool = typer.Option(False, "--apply", help="Apply changes. Defaults to dry-run."),
     no_ai: bool = typer.Option(False, "--no-ai", help="Skip AI classification entirely (rules only)."),
     recursive: bool = typer.Option(False, "--recursive", "-r", help="Recurse into subdirectories."),
+    distributed: bool = typer.Option(
+        False, "--distributed",
+        help="Run via the queue + worker runtime instead of the inline pipeline.",
+    ),
+    backend: str = typer.Option(
+        "memory", "--backend",
+        help="Queue backend when --distributed: 'memory' (in-process) or 'redis'.",
+    ),
+    redis_url: str = typer.Option(
+        "redis://localhost:6379/0", "--redis-url",
+        help="Redis URL when --backend=redis.",
+    ),
+    workers: int = typer.Option(
+        2, "--workers",
+        help="Inline workers per route (memory backend only). Use 0 with redis to defer to external workers.",
+    ),
+    timeout: float = typer.Option(
+        300.0, "--timeout",
+        help="Max seconds to wait for distributed results before filling Unknown_Unsorted.",
+    ),
     verbose: int = typer.Option(0, "--verbose", "-v", count=True, help="Increase verbosity (-v, -vv)."),
 ):
-    """Sort files in TARGET_DIR using rules + local AI."""
+    """Sort files in TARGET_DIR.
+
+    Two modes:
+
+      smartsort run <dir>                       # local: one process, inline pipeline
+      smartsort run <dir> --distributed         # distributed: router + queues + workers
+      smartsort run <dir> --distributed --backend redis --redis-url redis://...
+    """
     _configure_logging(verbose)
 
     target = Path(target_dir).expanduser().resolve()
@@ -121,48 +147,103 @@ def run(
         console.print(f"[red]Error: Directory {target_dir} not found.[/red]")
         raise typer.Exit(1)
 
-    console.rule("[bold blue]SmartSort Initialisation")
-
     config = _load_config()
     categories = list(config["categories"].keys())
-    console.log("[green]✓[/green] Configuration loaded.")
+    files = _gather_files(target, recursive=recursive, category_names=set(categories))
+    scope = "recursively" if recursive else "at top level"
+    console.print(f"[cyan]Found {len(files)} files {scope} in {target}.[/cyan]")
+    if not files:
+        console.print("[yellow]Nothing to do.[/yellow]")
+        return
 
+    if distributed:
+        plan = _run_distributed(
+            files=files,
+            config=config,
+            backend=backend,
+            redis_url=redis_url,
+            workers=workers,
+            timeout=timeout,
+        )
+    else:
+        plan = _run_local(files=files, config=config, no_ai=no_ai)
+
+    _print_plan(plan, apply)
+
+    if apply:
+        organizer = Organizer(str(target), category_names=categories)
+        organizer.move_files({fp: c.to_dict() for fp, c in plan.items()}, apply=True)
+        console.print(f"[bold green]\nFiles sorted. Undo log: {organizer.undo_log}[/bold green]")
+        console.print("[dim]Run `smartsort undo <dir>` to revert.[/dim]")
+    else:
+        console.print("\n[yellow]Dry-run complete. Run with --apply to move files.[/yellow]")
+
+
+def _run_local(*, files: list[Path], config: dict, no_ai: bool) -> dict[str, Classification]:
+    """Inline single-process pipeline (the original v0.2 path)."""
     with console.status("[bold yellow]Building pipeline (Ollama health check)..."):
         pipeline, ai_status = _build_pipeline(config, no_ai=no_ai)
     console.log(ai_status)
-
-    organizer = Organizer(str(target), category_names=categories)
-
-    console.rule("[bold blue]Scanning Files")
-
-    files = _gather_files(target, recursive=recursive, category_names=set(categories))
-    skipped = sum(
-        1
-        for sub in target.iterdir()
-        if sub.is_dir() and sub.name in categories
-        for inner in sub.iterdir()
-        if inner.is_file()
-    )
-    scope = "recursively" if recursive else "at top level"
-    console.print(
-        f"[cyan]Found {len(files)} files {scope} in {target}[/cyan] "
-        f"(skipping {skipped} already inside category folders).\n"
-    )
 
     plan: dict[str, Classification] = {}
     with console.status("[bold green]Classifying files...") as status:
         for path in files:
             status.update(f"[bold green]Classifying: {path.name}")
             plan[str(path)] = pipeline.classify(FileItem(path=path))
+    return plan
 
-    _print_plan(plan, apply)
 
-    if apply:
-        organizer.move_files({fp: c.to_dict() for fp, c in plan.items()}, apply=True)
-        console.print(f"[bold green]\nFiles sorted. Undo log: {organizer.undo_log}[/bold green]")
-        console.print("[dim]Run `smartsort undo <dir>` (or `python main.py undo <dir>`) to revert.[/dim]")
-    else:
-        console.print("\n[yellow]Dry-run complete. Run with --apply to move files.[/yellow]")
+def _run_distributed(
+    *,
+    files: list[Path],
+    config: dict,
+    backend: str,
+    redis_url: str,
+    workers: int,
+    timeout: float,
+) -> dict[str, Classification]:
+    """Producer/worker path via the inference package."""
+    backend_kwargs = {"url": redis_url} if backend == "redis" else {}
+    qb = build_backend(backend, **backend_kwargs)
+    router = Router.default()
+
+    inline_workers: list[Worker] = []
+    threads: list = []
+    if workers > 0 and backend == "memory":
+        for route in (ROUTE_RULES, ROUTE_AI_SMALL, ROUTE_AI_LARGE, ROUTE_OCR):
+            for i in range(workers):
+                classifier = _build_worker_classifier(route, config, None)
+                w = Worker(name=f"{route}-{i}", routes=[route], classifier=classifier, backend=qb)
+                inline_workers.append(w)
+                threads.append(w.run_in_thread())
+        console.print(f"[dim]Spawned {len(inline_workers)} inline workers across 4 routes.[/dim]")
+    elif workers > 0 and backend == "redis":
+        console.print(
+            "[yellow]--workers ignored with --backend=redis; "
+            "start external workers via `smartsort serve-worker` or docker compose.[/yellow]"
+        )
+
+    orchestrator = Orchestrator(backend=qb, router=router)
+    pending = orchestrator.submit(files)
+    console.print(f"[cyan]Submitted {len(pending)} jobs via {backend} backend.[/cyan]")
+    for route, count in orchestrator.stats.by_route.items():
+        console.print(f"  [magenta]{route}[/magenta]: {count}")
+
+    with console.status("[bold green]Awaiting worker results..."):
+        plan = orchestrator.collect(pending, timeout=timeout)
+
+    for w in inline_workers:
+        w.stop()
+    for t in threads:
+        t.join(timeout=2.0)
+    qb.close()
+
+    console.print(
+        f"[dim]submitted={orchestrator.stats.submitted} "
+        f"completed={orchestrator.stats.completed} "
+        f"failed={orchestrator.stats.failed}[/dim]"
+    )
+    return plan
 
 
 @app.command()
@@ -281,30 +362,46 @@ def _build_worker_classifier(route: str, config: dict, model_override: str | Non
 
 @app.command(name="serve-worker")
 def serve_worker(
-    route: str = typer.Option(..., "--route", "-r", help=f"Queue to subscribe to (e.g. {ROUTE_RULES}, {ROUTE_AI_SMALL}, {ROUTE_AI_LARGE})."),
-    backend: str = typer.Option("memory", "--backend", help="Queue backend: memory | redis."),
+    routes: str = typer.Option(
+        ...,
+        "--routes", "-r",
+        help=f"Comma-separated routes to subscribe to (any of: {ROUTE_RULES}, {ROUTE_AI_SMALL}, {ROUTE_AI_LARGE}, {ROUTE_OCR}). "
+             f"One worker can cover multiple routes — handy for absorbing the OCR queue with a rules fallback.",
+    ),
+    backend: str = typer.Option("redis", "--backend", help="Queue backend: redis | memory."),
     redis_url: str = typer.Option("redis://localhost:6379/0", "--redis-url"),
     model: str = typer.Option(None, "--model", help="Override the Ollama model for AI routes."),
-    name: str = typer.Option(None, "--name", help="Worker name (defaults to route + pid)."),
+    name: str = typer.Option(None, "--name", help="Worker name (defaults to first-route + pid)."),
     verbose: int = typer.Option(0, "--verbose", "-v", count=True),
 ):
-    """Run a worker that consumes jobs for one or more routes.
+    """Run a long-lived worker that consumes jobs from one or more route queues.
 
-    Memory-backed workers are only useful inside one process (tests, single
-    machine demos). The Redis backend is what you'd run under Docker / k8s.
+    The worker uses the classifier configured for its primary route. Pass
+    multiple routes to drain several queues from one process — for example
+    `--routes rules,ocr` runs a single cheap worker that handles both the
+    rules fallback and the OCR queue while a separate AI worker handles the
+    LLM-bound routes.
     """
     _configure_logging(verbose)
     config = _load_config()
 
+    route_list = [r.strip() for r in routes.split(",") if r.strip()]
+    if not route_list:
+        raise typer.BadParameter("at least one route required")
+
     import os
-    worker_name = name or f"{route}-{os.getpid()}"
+    worker_name = name or f"{route_list[0]}-{os.getpid()}"
 
     backend_kwargs = {"url": redis_url, "consumer_name": worker_name} if backend == "redis" else {}
     qb = build_backend(backend, **backend_kwargs)
-    classifier = _build_worker_classifier(route, config, model)
-    worker = Worker(name=worker_name, routes=[route], classifier=classifier, backend=qb)
+    # Classifier is keyed off the primary route — if you mix AI and non-AI
+    # routes on one worker, name the AI route first so the LLM is wired up.
+    classifier = _build_worker_classifier(route_list[0], config, model)
+    worker = Worker(name=worker_name, routes=route_list, classifier=classifier, backend=qb)
 
-    console.print(f"[green]Worker {worker_name} listening on route '{route}' via {backend}.[/green]")
+    console.print(
+        f"[green]Worker {worker_name} listening on {route_list} via {backend}.[/green]"
+    )
     console.print("[dim]Ctrl-C to stop.[/dim]")
     try:
         worker.run()
@@ -317,99 +414,6 @@ def serve_worker(
             f"[cyan]Processed {worker.stats.processed}, "
             f"failed {worker.stats.failed}.[/cyan]"
         )
-
-
-@app.command()
-def dispatch(
-    target_dir: str = typer.Argument(..., help="Directory to sort via the distributed queue."),
-    backend: str = typer.Option("memory", "--backend", help="Queue backend: memory | redis."),
-    redis_url: str = typer.Option("redis://localhost:6379/0", "--redis-url"),
-    apply: bool = typer.Option(False, "--apply", help="Apply the resulting plan."),
-    recursive: bool = typer.Option(False, "--recursive", "-r"),
-    timeout: float = typer.Option(300.0, "--timeout", help="Max seconds to wait for results."),
-    inline_workers: int = typer.Option(
-        0,
-        "--inline-workers",
-        help="If >0, spin up this many in-process workers per route (memory backend only).",
-    ),
-    verbose: int = typer.Option(0, "--verbose", "-v", count=True),
-):
-    """Enqueue every file as an inference job and collect classifications.
-
-    Use this against an external worker fleet (Redis backend) or, for quick
-    local experiments, with --inline-workers to spawn workers in-process.
-    """
-    _configure_logging(verbose)
-
-    target = Path(target_dir).expanduser().resolve()
-    if not target.exists() or not target.is_dir():
-        console.print(f"[red]Error: Directory {target_dir} not found.[/red]")
-        raise typer.Exit(1)
-
-    config = _load_config()
-    categories = list(config["categories"].keys())
-    files = _gather_files(target, recursive=recursive, category_names=set(categories))
-    console.print(f"[cyan]Found {len(files)} files in {target}[/cyan]")
-
-    backend_kwargs = {"url": redis_url} if backend == "redis" else {}
-    qb = build_backend(backend, **backend_kwargs)
-    router = Router.default()
-
-    console.rule("[bold blue]Routing plan")
-    table = Table()
-    table.add_column("Route", style="magenta")
-    table.add_column("Description", style="white")
-    for name, note in describe_routes(router):
-        table.add_row(name, note)
-    console.print(table)
-
-    workers: list[Worker] = []
-    threads: list = []
-    if inline_workers > 0:
-        if backend != "memory":
-            console.print("[yellow]--inline-workers is only supported on the memory backend.[/yellow]")
-        else:
-            for route in {ROUTE_RULES, ROUTE_AI_SMALL, ROUTE_AI_LARGE, ROUTE_OCR}:
-                for i in range(inline_workers):
-                    classifier = _build_worker_classifier(route, config, None)
-                    w = Worker(
-                        name=f"{route}-{i}",
-                        routes=[route],
-                        classifier=classifier,
-                        backend=qb,
-                    )
-                    workers.append(w)
-                    threads.append(w.run_in_thread())
-
-    orchestrator = Orchestrator(backend=qb, router=router)
-    pending = orchestrator.submit(p for p in files)
-    console.print(f"[cyan]Submitted {len(pending)} jobs.[/cyan]")
-    for route, count in orchestrator.stats.by_route.items():
-        console.print(f"  [magenta]{route}[/magenta]: {count}")
-
-    plan: dict[str, Classification] = {}
-    with console.status("[bold green]Awaiting worker results..."):
-        plan = orchestrator.collect(pending, timeout=timeout)
-
-    for w in workers:
-        w.stop()
-    for t in threads:
-        t.join(timeout=2.0)
-    qb.close()
-
-    _print_plan(plan, apply)
-    console.print(
-        f"[dim]submitted={orchestrator.stats.submitted} "
-        f"completed={orchestrator.stats.completed} "
-        f"failed={orchestrator.stats.failed}[/dim]"
-    )
-
-    if apply:
-        organizer = Organizer(str(target), category_names=categories)
-        organizer.move_files({fp: c.to_dict() for fp, c in plan.items()}, apply=True)
-        console.print(f"[bold green]\nFiles sorted. Undo log: {organizer.undo_log}[/bold green]")
-    else:
-        console.print("\n[yellow]Dry-run complete. Run with --apply to move files.[/yellow]")
 
 
 if __name__ == "__main__":

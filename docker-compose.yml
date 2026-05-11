@@ -1,12 +1,29 @@
-# Local dev stack for the distributed inference prototype.
+# Local development stack for the distributed inference runtime.
 #
-# Bring it up with:    docker compose up --build
-# Submit a directory:  docker compose run --rm dispatcher \
-#                          dispatch /work --backend redis --redis-url redis://redis:6379/0
+# Usage:
+#   docker compose up --build              # start redis + one worker per route
+#   docker compose up --scale ai-small-worker=4   # scale a route horizontally
 #
-# The two worker services illustrate the routing topology: one pool consumes
-# the cheap "rules" queue, the other consumes the AI queues. Add more
-# instances of either with `docker compose up --scale ai-worker=4`.
+# To submit work from your host machine (workers stay running here):
+#   smartsort run ./workdir --distributed --backend redis --redis-url redis://localhost:6379/0
+#
+# Or run the dispatcher inside the network:
+#   docker compose run --rm cli run /work --distributed --backend redis \
+#                                  --redis-url redis://redis:6379/0
+#
+# Linux note: AI workers reach Ollama via host.docker.internal. The
+# `extra_hosts: host-gateway` entries make this work the same way on Linux
+# as it already does on Docker Desktop (Mac / Windows).
+
+x-worker-base: &worker-base
+  build: .
+  depends_on:
+    redis:
+      condition: service_healthy
+  volumes:
+    - ./workdir:/work
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
 
 services:
   redis:
@@ -19,64 +36,52 @@ services:
       timeout: 2s
       retries: 10
 
+  # Cheap worker: drains the rules queue AND the OCR queue (which currently
+  # falls back to rules until a real OCR classifier lands). One process,
+  # two routes — same image as everyone else.
   rules-worker:
-    build: .
-    depends_on:
-      redis:
-        condition: service_healthy
+    <<: *worker-base
     command:
       - serve-worker
-      - --route
-      - rules
+      - --routes
+      - rules,ocr
       - --backend
       - redis
       - --redis-url
       - redis://redis:6379/0
-    volumes:
-      - ./workdir:/work
+      - -v
 
   ai-small-worker:
-    build: .
-    depends_on:
-      redis:
-        condition: service_healthy
+    <<: *worker-base
     environment:
       - OLLAMA_HOST=http://host.docker.internal:11434
     command:
       - serve-worker
-      - --route
+      - --routes
       - ai-small
       - --backend
       - redis
       - --redis-url
       - redis://redis:6379/0
-    volumes:
-      - ./workdir:/work
+      - -v
 
   ai-large-worker:
-    build: .
-    depends_on:
-      redis:
-        condition: service_healthy
+    <<: *worker-base
     environment:
       - OLLAMA_HOST=http://host.docker.internal:11434
     command:
       - serve-worker
-      - --route
+      - --routes
       - ai-large
       - --backend
       - redis
       - --redis-url
       - redis://redis:6379/0
-    volumes:
-      - ./workdir:/work
+      - -v
 
-  dispatcher:
-    build: .
-    depends_on:
-      redis:
-        condition: service_healthy
-    profiles: ["cli"]   # only runs on explicit `docker compose run dispatcher`
-    volumes:
-      - ./workdir:/work
+  # On-demand CLI for running `smartsort run ...` inside the compose network.
+  # Started only via `docker compose run --rm cli ...`, never on `up`.
+  cli:
+    <<: *worker-base
+    profiles: ["cli"]
     entrypoint: ["python", "main.py"]
