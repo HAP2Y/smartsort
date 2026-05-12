@@ -20,6 +20,13 @@ from classifier.extractor import FileExtractor
 from classifier.pipeline import ClassificationPipeline
 from classifier.rules import RulesEngine
 from classifier.types import Classification, FileItem
+from inference import Orchestrator, Router, Worker, build_backend
+from inference.router import (
+    ROUTE_AI_LARGE,
+    ROUTE_AI_SMALL,
+    ROUTE_OCR,
+    ROUTE_RULES,
+)
 from movers.organizer import Organizer
 
 CONFIG_PATH = Path(__file__).parent / "config" / "categories.yaml"
@@ -103,9 +110,45 @@ def run(
     apply: bool = typer.Option(False, "--apply", help="Apply changes. Defaults to dry-run."),
     no_ai: bool = typer.Option(False, "--no-ai", help="Skip AI classification entirely (rules only)."),
     recursive: bool = typer.Option(False, "--recursive", "-r", help="Recurse into subdirectories."),
+    distributed: bool = typer.Option(
+        False, "--distributed",
+        help="Run via the queue + worker runtime instead of the inline pipeline.",
+    ),
+    backend: str = typer.Option(
+        "memory", "--backend",
+        help="Queue backend when --distributed: 'memory' (in-process) or 'redis'.",
+    ),
+    redis_url: str = typer.Option(
+        "redis://localhost:6379/0", "--redis-url",
+        help="Redis URL when --backend=redis.",
+    ),
+    workers: int = typer.Option(
+        2, "--workers",
+        help="Inline workers per route (memory backend only). Use 0 with redis to defer to external workers.",
+    ),
+    timeout: float = typer.Option(
+        300.0, "--timeout",
+        help="Max seconds to wait for distributed results before filling Unknown_Unsorted.",
+    ),
+    up: bool = typer.Option(
+        False, "--up",
+        help="With --backend=redis, run `docker compose up -d --build` first to start the worker fleet, "
+             "then dispatch. Workers are left running afterward for reuse.",
+    ),
+    down: bool = typer.Option(
+        False, "--down",
+        help="After dispatching, run `docker compose down` to tear the fleet back down.",
+    ),
     verbose: int = typer.Option(0, "--verbose", "-v", count=True, help="Increase verbosity (-v, -vv)."),
 ):
-    """Sort files in TARGET_DIR using rules + local AI."""
+    """Sort files in TARGET_DIR.
+
+    Two modes:
+
+      smartsort run <dir>                       # local: one process, inline pipeline
+      smartsort run <dir> --distributed         # distributed: router + queues + workers
+      smartsort run <dir> --distributed --backend redis --redis-url redis://...
+    """
     _configure_logging(verbose)
 
     target = Path(target_dir).expanduser().resolve()
@@ -113,48 +156,355 @@ def run(
         console.print(f"[red]Error: Directory {target_dir} not found.[/red]")
         raise typer.Exit(1)
 
-    console.rule("[bold blue]SmartSort Initialisation")
-
     config = _load_config()
     categories = list(config["categories"].keys())
-    console.log("[green]✓[/green] Configuration loaded.")
+    files = _gather_files(target, recursive=recursive, category_names=set(categories))
+    scope = "recursively" if recursive else "at top level"
+    console.print(f"[cyan]Found {len(files)} files {scope} in {target}.[/cyan]")
+    if not files:
+        console.print("[yellow]Nothing to do.[/yellow]")
+        return
 
+    if (up or down) and not (distributed and backend == "redis"):
+        console.print(
+            "[yellow]--up/--down only apply with --distributed --backend redis; ignoring.[/yellow]"
+        )
+        up = False
+        down = False
+
+    brought_up = False
+    if up:
+        # Pre-route locally to size the fleet — every file goes through
+        # an AI worker, so the autoscaler counts cover the full workload.
+        counts = _route_counts(files, Router.default())
+        targets = _scale_targets(counts)
+        console.print(
+            "[dim]Route counts: "
+            + (", ".join(f"{r}={n}" for r, n in sorted(counts.items())) or "none")
+            + "[/dim]"
+        )
+        brought_up = _compose_up(scale=targets)
+        if not brought_up:
+            raise typer.Exit(1)
+
+    try:
+        if distributed:
+            plan = _run_distributed(
+                files=files,
+                config=config,
+                backend=backend,
+                redis_url=redis_url,
+                workers=workers,
+                timeout=timeout,
+            )
+        else:
+            plan = _run_local(files=files, config=config, no_ai=no_ai)
+
+        _print_plan(plan, apply)
+
+        if apply:
+            organizer = Organizer(str(target), category_names=categories)
+            organizer.move_files({fp: c.to_dict() for fp, c in plan.items()}, apply=True)
+            console.print(f"[bold green]\nFiles sorted. Undo log: {organizer.undo_log}[/bold green]")
+            console.print("[dim]Run `smartsort undo <dir>` to revert.[/dim]")
+        else:
+            console.print("\n[yellow]Dry-run complete. Run with --apply to move files.[/yellow]")
+    finally:
+        if down and brought_up:
+            _compose_down()
+        elif brought_up and not down:
+            console.print(
+                "[dim]Worker fleet left running. "
+                "Stop it with `docker compose down` or re-run with --down.[/dim]"
+            )
+
+
+def _run_local(*, files: list[Path], config: dict, no_ai: bool) -> dict[str, Classification]:
+    """Inline single-process pipeline (the original v0.2 path)."""
     with console.status("[bold yellow]Building pipeline (Ollama health check)..."):
         pipeline, ai_status = _build_pipeline(config, no_ai=no_ai)
     console.log(ai_status)
-
-    organizer = Organizer(str(target), category_names=categories)
-
-    console.rule("[bold blue]Scanning Files")
-
-    files = _gather_files(target, recursive=recursive, category_names=set(categories))
-    skipped = sum(
-        1
-        for sub in target.iterdir()
-        if sub.is_dir() and sub.name in categories
-        for inner in sub.iterdir()
-        if inner.is_file()
-    )
-    scope = "recursively" if recursive else "at top level"
-    console.print(
-        f"[cyan]Found {len(files)} files {scope} in {target}[/cyan] "
-        f"(skipping {skipped} already inside category folders).\n"
-    )
 
     plan: dict[str, Classification] = {}
     with console.status("[bold green]Classifying files...") as status:
         for path in files:
             status.update(f"[bold green]Classifying: {path.name}")
             plan[str(path)] = pipeline.classify(FileItem(path=path))
+    return plan
 
-    _print_plan(plan, apply)
 
-    if apply:
-        organizer.move_files({fp: c.to_dict() for fp, c in plan.items()}, apply=True)
-        console.print(f"[bold green]\nFiles sorted. Undo log: {organizer.undo_log}[/bold green]")
-        console.print("[dim]Run `smartsort undo <dir>` (or `python main.py undo <dir>`) to revert.[/dim]")
+# --------------------------------------------------- compose lifecycle
+
+
+# Per-route scale tuning.
+#
+# Only AI workers exist as Compose services — rules are run inline on the
+# dispatcher (the queue is for expensive work, not for filename matching),
+# and OCR has no implementation yet so OCR-routed files are classified as
+# Unknown locally rather than enqueued.
+#
+# `files_per_worker` is the soft saturation point. `max_workers` caps the
+# autoscaler so a directory of 10k files doesn't spawn 400 containers.
+# Caps stay low because a single host Ollama serialises LLM calls — replicas
+# past 2-3 add memory pressure without throughput. Point at a multi-instance
+# Ollama setup and raise the caps to scale further.
+COMPOSE_SCALE = {
+    "ai-small-worker": {"files_per_worker": 25, "max_workers": 2},
+    "ai-large-worker": {"files_per_worker": 10, "max_workers": 1},
+}
+
+
+def _compose_cmd() -> list[str] | None:
+    """Return the docker-compose invocation that works on this host, or None."""
+    import shutil
+    if shutil.which("docker"):
+        # docker compose (v2 plugin) is the modern form; docker-compose (v1)
+        # is the legacy binary. We'll prefer v2 and fall back to v1.
+        import subprocess
+        probe = subprocess.run(
+            ["docker", "compose", "version"],
+            capture_output=True, text=True,
+        )
+        if probe.returncode == 0:
+            return ["docker", "compose"]
+    if shutil.which("docker-compose"):
+        return ["docker-compose"]
+    return None
+
+
+def _route_counts(files: list[Path], router: Router) -> dict[str, int]:
+    """Pure pre-pass: ask the router where each file would go, without enqueuing."""
+    counts: dict[str, int] = {}
+    for path in files:
+        route = router.route(FileItem(path=path))
+        counts[route] = counts.get(route, 0) + 1
+    return counts
+
+
+def _scale_targets(counts: dict[str, int]) -> dict[str, int]:
+    """Map compose service -> desired replicas, sized for the workload.
+
+    Only AI services scale here — rules and OCR are not Compose services
+    in the new architecture (rules runs inline; OCR is unimplemented and
+    classified Unknown on the dispatcher).
+    """
+    import math
+    ai_small = counts.get(ROUTE_AI_SMALL, 0)
+    ai_large = counts.get(ROUTE_AI_LARGE, 0)
+
+    def _scale(jobs: int, cfg: dict) -> int:
+        if jobs <= 0:
+            return 1  # keep one warm worker in case stray jobs land
+        return min(cfg["max_workers"], max(1, math.ceil(jobs / cfg["files_per_worker"])))
+
+    return {
+        "ai-small-worker": _scale(ai_small, COMPOSE_SCALE["ai-small-worker"]),
+        "ai-large-worker": _scale(ai_large, COMPOSE_SCALE["ai-large-worker"]),
+    }
+
+
+def _compose_up(scale: dict[str, int] | None = None) -> bool:
+    """Start the worker fleet via `docker compose up -d --build`.
+
+    Returns True on success. Honours `scale` by passing `--scale svc=N` for
+    each service so the fleet is sized to the workload from the start.
+    """
+    import subprocess
+    base = _compose_cmd()
+    if base is None:
+        console.print("[red]--up requires docker (compose v2) or docker-compose on PATH.[/red]")
+        return False
+    if not Path("docker-compose.yml").exists():
+        console.print("[red]--up needs docker-compose.yml in the current directory.[/red]")
+        return False
+
+    cmd = base + ["up", "-d", "--build"]
+    if scale:
+        for service, n in scale.items():
+            cmd += ["--scale", f"{service}={n}"]
+        scale_summary = ", ".join(f"{s}={n}" for s, n in scale.items())
+        console.print(f"[bold cyan]Bringing fleet up: {scale_summary}[/bold cyan]")
     else:
-        console.print("\n[yellow]Dry-run complete. Run with --apply to move files.[/yellow]")
+        console.print("[bold cyan]Bringing fleet up...[/bold cyan]")
+
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        console.print("[red]docker compose up failed; see output above.[/red]")
+        return False
+
+    # Workers subscribe to Redis on startup; give them a beat so the first
+    # XADD doesn't land before any consumer has joined the group.
+    import time
+    time.sleep(2)
+    return True
+
+
+def _compose_down() -> None:
+    import subprocess
+    base = _compose_cmd()
+    if base is None:
+        return
+    console.print("[bold cyan]Tearing fleet down...[/bold cyan]")
+    subprocess.run(base + ["down"])
+
+
+# --------------------------------------------------- distributed runner
+
+
+def _run_distributed(
+    *,
+    files: list[Path],
+    config: dict,
+    backend: str,
+    redis_url: str,
+    workers: int,
+    timeout: float,
+) -> dict[str, Classification]:
+    """Producer/worker path via the inference package.
+
+    Architecture: every file goes onto an AI worker queue. Workers run
+    AI-first (Local AI → HC rules → fallback rules), so the LLM gets to
+    weigh in on every file and rules only catch the cases where AI
+    declines. The router still picks ai-small / ai-large by size +
+    extension; images route to UNROUTABLE (no OCR worker today) and are
+    classified Unknown_Unsorted on the dispatcher with a clear reason.
+    """
+    from inference.diagnostics import (
+        ProgressReporter,
+        preflight_ollama,
+        preflight_redis,
+        preflight_workers,
+        queue_depths,
+        tail_compose_logs,
+    )
+    from inference.router import ROUTE_UNROUTABLE
+    from classifier.ai_local import DEFAULT_OLLAMA_URL
+
+    backend_kwargs = {"url": redis_url} if backend == "redis" else {}
+    qb = build_backend(backend, **backend_kwargs)
+    router = Router.default()
+
+    # -------------------- Pre-route locally so unroutable files (e.g.
+    # images without an OCR worker) get a clean "Unknown" verdict instead
+    # of being enqueued to a queue that nobody drains.
+    plan: dict[str, Classification] = {}
+    enqueueable: list[Path] = []
+    for path in files:
+        route = router.route(FileItem(path=path))
+        if route == ROUTE_UNROUTABLE:
+            plan[str(path)] = Classification.unknown(
+                reason="no AI / OCR worker available for this file type",
+                method="Router",
+            )
+        else:
+            enqueueable.append(path)
+
+    if not enqueueable:
+        console.print("[cyan]No files require worker processing.[/cyan]")
+        qb.close()
+        return plan
+
+    # -------------------- Inline workers for the memory backend
+    inline_workers: list[Worker] = []
+    threads: list = []
+    if workers > 0 and backend == "memory":
+        for route in (ROUTE_AI_SMALL, ROUTE_AI_LARGE):
+            for i in range(workers):
+                classifier = _build_worker_classifier(route, config, None)
+                w = Worker(name=f"{route}-{i}", routes=[route], classifier=classifier, backend=qb)
+                inline_workers.append(w)
+                threads.append(w.run_in_thread())
+        console.print(f"[dim]Spawned {len(inline_workers)} inline AI workers.[/dim]")
+    elif workers > 0 and backend == "redis":
+        console.print(
+            "[yellow]--workers ignored with --backend=redis; "
+            "start external workers via `smartsort serve-worker` or docker-compose.[/yellow]"
+        )
+
+    # Per-route counts so preflight knows which routes need consumers
+    # and progress reporting can show denominators.
+    expected_by_route: dict[str, int] = {}
+    for path in enqueueable:
+        r = router.route(FileItem(path=path))
+        expected_by_route[r] = expected_by_route.get(r, 0) + 1
+
+    # -------------------- Pre-flight
+    if backend == "redis":
+        console.rule("[bold cyan]Pre-flight")
+        checks = [preflight_redis(redis_url)]
+        active_routes = [r for r, n in expected_by_route.items() if n > 0]
+        checks.extend(preflight_workers(redis_url, active_routes))
+        if any(r in active_routes for r in (ROUTE_AI_SMALL, ROUTE_AI_LARGE)):
+            checks.append(preflight_ollama(DEFAULT_OLLAMA_URL))
+        for c in checks:
+            colour = "green" if c.ok else "red"
+            console.print(f"[{colour}]{c.status} {c.name}[/{colour}]: {c.detail}")
+        blockers = [c for c in checks if not c.ok and c.name == "redis"]
+        if blockers:
+            console.print(
+                "[red]Aborting: cannot reach Redis. Bring the fleet up with --up "
+                "or start it manually with `docker-compose up -d`.[/red]"
+            )
+            qb.close()
+            raise typer.Exit(1)
+        console.rule()
+
+    # -------------------- Submit + drain
+    orchestrator = Orchestrator(backend=qb, router=router)
+    pending = orchestrator.submit(enqueueable)
+    console.print(f"[cyan]Submitted {len(pending)} jobs via {backend} backend.[/cyan]")
+    for route, count in orchestrator.stats.by_route.items():
+        console.print(f"  [magenta]{route}[/magenta]: {count}")
+
+    progress = ProgressReporter(
+        expected_total=len(pending),
+        expected_by_route=dict(orchestrator.stats.by_route),
+        tick_seconds=5.0,
+        _printer=lambda msg: console.print(f"[dim]{msg}[/dim]"),
+    )
+    worker_plan = orchestrator.collect(pending, timeout=timeout, on_result=progress.on_result)
+    progress.final()
+    plan.update(worker_plan)
+
+    for w in inline_workers:
+        w.stop()
+    for t in threads:
+        t.join(timeout=2.0)
+
+    # -------------------- Post-mortem (only on failures)
+    if backend == "redis" and orchestrator.stats.failed > 0:
+        console.rule("[bold red]Post-mortem")
+        depths = queue_depths(qb, list(expected_by_route))
+        for route, depth in depths.items():
+            if depth > 0:
+                console.print(f"[red]queue {route}[/red]: {depth} entries still in flight")
+        services = []
+        if depths.get(ROUTE_AI_SMALL, 0) > 0:
+            services.append("ai-small-worker")
+        if depths.get(ROUTE_AI_LARGE, 0) > 0:
+            services.append("ai-large-worker")
+        if services:
+            logs = tail_compose_logs(services, lines=10)
+            for svc, body in logs.items():
+                console.print(f"[bold]── {svc} (last 10 log lines) ──[/bold]")
+                console.print(body or "[dim](empty)[/dim]")
+        console.print(
+            "\n[yellow]Hints:[/yellow]\n"
+            "  • Smaller / faster model: set `models.ai-small: qwen2.5:3b` in config/categories.yaml.\n"
+            "  • Longer timeout: --timeout 1200.\n"
+            "  • More replicas: `docker-compose up -d --scale ai-small-worker=N`.\n"
+            "  • Lower confidence_threshold so the LLM's lower-confidence answers count.\n"
+        )
+        console.rule()
+
+    qb.close()
+
+    console.print(
+        f"[dim]submitted={orchestrator.stats.submitted} "
+        f"completed={orchestrator.stats.completed} "
+        f"failed={orchestrator.stats.failed}[/dim]"
+    )
+    return plan
 
 
 @app.command()
@@ -230,6 +580,139 @@ def _print_plan(plan: dict[str, Classification], apply: bool) -> None:
     for cat, count in sorted(summary.items(), key=lambda x: -x[1]):
         summary_table.add_row(cat, str(count))
     console.print(summary_table)
+
+
+# --------------------------------------------------- distributed inference
+
+
+def _model_for_route(config: dict, route: str, override: str | None = None) -> str:
+    """Resolve which Ollama model a given route should use.
+
+    Resolution order:
+      1. explicit --model override
+      2. settings.models.<route>             (preferred, per-route)
+      3. settings.large_model                (legacy, for ai-large only)
+      4. settings.default_local_model        (legacy fallback)
+    """
+    if override:
+        return override
+    settings = config["settings"]
+    per_route = (settings.get("models") or {}).get(route)
+    if per_route:
+        return per_route
+    if route == ROUTE_AI_LARGE:
+        return settings.get("large_model", settings["default_local_model"])
+    return settings["default_local_model"]
+
+
+def _build_worker_classifier(route: str, config: dict, model_override: str | None):
+    """Pick the right classifier for a given queue route.
+
+    Pipeline order is **AI first**, rules as a fallback. The previous
+    order (HC-rules → AI → rules) meant every file with a familiar
+    keyword in its name short-circuited the LLM, so the AI fleet was
+    expensive plumbing that almost never ran. Now the LLM gets to weigh
+    in on every file the dispatcher hands it; rules only catch the
+    cases where the LLM declines (no extractable text, output not in
+    the allowed category set, confidence below threshold).
+    """
+    rules = RulesEngine(str(CONFIG_PATH))
+    categories = list(config["categories"].keys())
+    threshold = config["settings"]["confidence_threshold"]
+
+    if route in (ROUTE_AI_SMALL, ROUTE_AI_LARGE):
+        model = _model_for_route(config, route, model_override)
+        ai = LocalAIClassifier(model=model)
+        extractor = FileExtractor(max_chars=config["settings"]["max_extract_chars"])
+        return ClassificationPipeline([
+            LocalAIPipelineClassifier(ai, extractor, categories, threshold, enabled=True),
+            HighConfidenceRulesClassifier(rules),  # safety net: unambiguous filename markers
+            RulesClassifier(rules),                # last resort: keyword + extension fallback
+        ])
+    if route in (ROUTE_RULES, ROUTE_OCR):
+        log.warning(
+            "route %r has no dedicated worker in the new architecture; "
+            "serving as rules-pipeline for backward compatibility", route,
+        )
+        return ClassificationPipeline([
+            HighConfidenceRulesClassifier(rules),
+            RulesClassifier(rules),
+        ])
+    raise typer.BadParameter(f"unknown route: {route!r}")
+
+
+@app.command(name="serve-worker")
+def serve_worker(
+    routes: str = typer.Option(
+        ...,
+        "--routes", "-r",
+        help=f"Comma-separated routes to subscribe to (any of: {ROUTE_RULES}, {ROUTE_AI_SMALL}, {ROUTE_AI_LARGE}, {ROUTE_OCR}). "
+             f"One worker can cover multiple routes — handy for absorbing the OCR queue with a rules fallback.",
+    ),
+    backend: str = typer.Option("redis", "--backend", help="Queue backend: redis | memory."),
+    redis_url: str = typer.Option("redis://localhost:6379/0", "--redis-url"),
+    model: str = typer.Option(None, "--model", help="Override the Ollama model for AI routes."),
+    name: str = typer.Option(None, "--name", help="Worker name (defaults to first-route + pid)."),
+    verbose: int = typer.Option(0, "--verbose", "-v", count=True),
+):
+    """Run a long-lived worker that consumes jobs from one or more route queues.
+
+    The worker uses the classifier configured for its primary route. Pass
+    multiple routes to drain several queues from one process — for example
+    `--routes rules,ocr` runs a single cheap worker that handles both the
+    rules fallback and the OCR queue while a separate AI worker handles the
+    LLM-bound routes.
+    """
+    _configure_logging(verbose)
+    config = _load_config()
+
+    route_list = [r.strip() for r in routes.split(",") if r.strip()]
+    if not route_list:
+        raise typer.BadParameter("at least one route required")
+
+    import os
+    worker_name = name or f"{route_list[0]}-{os.getpid()}"
+
+    backend_kwargs = {"url": redis_url, "consumer_name": worker_name} if backend == "redis" else {}
+    qb = build_backend(backend, **backend_kwargs)
+    # Classifier is keyed off the primary route — if you mix AI and non-AI
+    # routes on one worker, name the AI route first so the LLM is wired up.
+    classifier = _build_worker_classifier(route_list[0], config, model)
+    worker = Worker(name=worker_name, routes=route_list, classifier=classifier, backend=qb)
+
+    # Loud, structured startup banner so the user can see at a glance which
+    # model each worker is actually using and whether Ollama is reachable.
+    primary = route_list[0]
+    console.rule(f"[bold cyan]Worker {worker_name}")
+    console.print(f"[bold]routes  [/bold] {route_list}")
+    console.print(f"[bold]backend [/bold] {backend}")
+    if primary in (ROUTE_AI_SMALL, ROUTE_AI_LARGE):
+        from classifier.ai_local import DEFAULT_OLLAMA_URL, LocalAIClassifier
+        resolved_model = _model_for_route(config, primary, model)
+        console.print(f"[bold]model   [/bold] {resolved_model}")
+        console.print(f"[bold]ollama  [/bold] {DEFAULT_OLLAMA_URL}")
+        ok, msg = LocalAIClassifier(model=resolved_model).is_running()
+        colour = "green" if ok else "red"
+        console.print(f"[{colour}]health  → {msg}[/{colour}]")
+        if not ok:
+            console.print(
+                "[yellow]Worker will run with rules-fallback only until Ollama is reachable.[/yellow]"
+            )
+    else:
+        console.print(f"[bold]model   [/bold] (rules-only worker, no LLM)")
+    console.rule()
+    console.print("[dim]Ctrl-C to stop.[/dim]")
+    try:
+        worker.run()
+    except KeyboardInterrupt:
+        worker.stop()
+        console.print("\n[yellow]Worker stopping...[/yellow]")
+    finally:
+        qb.close()
+        console.print(
+            f"[cyan]Processed {worker.stats.processed}, "
+            f"failed {worker.stats.failed}.[/cyan]"
+        )
 
 
 if __name__ == "__main__":
