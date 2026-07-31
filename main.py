@@ -27,9 +27,11 @@ from inference.router import (
     ROUTE_OCR,
     ROUTE_RULES,
 )
+from movers.offboarding import Disposition, PolicyError, RetentionPolicy
 from movers.organizer import Organizer
 
 CONFIG_PATH = Path(__file__).parent / "config" / "categories.yaml"
+OFFBOARD_POLICY_PATH = Path(__file__).parent / "config" / "offboarding.yaml"
 
 app = typer.Typer(help="SmartSort - Local-first file classification & sorting", no_args_is_help=True)
 console = Console()
@@ -543,6 +545,148 @@ def undo(
         console.print(f"[yellow]Missing (already moved/deleted):[/yellow] {missing}")
     for err in errors:
         console.print(f"[red]Error:[/red] {err}")
+
+
+@app.command()
+def offboard(
+    target_dir: str = typer.Argument(
+        None, help="Directory to scan (e.g. ~/Downloads). Not needed with --explain.",
+    ),
+    export_to: str = typer.Option(
+        "./Offboarding_Bundle", "--export-to",
+        help="Where the KEEP bundle is written, organised by category.",
+    ),
+    apply: bool = typer.Option(False, "--apply", help="Actually write the bundle. Defaults to dry-run."),
+    move: bool = typer.Option(
+        False, "--move",
+        help="Move KEEP files instead of copying. Default is copy, so originals "
+             "stay put until you have verified the bundle.",
+    ),
+    no_ai: bool = typer.Option(False, "--no-ai", help="Rules only, skip the LLM."),
+    recursive: bool = typer.Option(False, "--recursive", "-r", help="Recurse into subdirectories."),
+    explain: bool = typer.Option(False, "--explain", help="Print the retention policy and exit."),
+    verbose: int = typer.Option(0, "--verbose", "-v", count=True),
+):
+    """Separate your own records from the company's work product.
+
+    Classifies every file, then applies the retention policy in
+    config/offboarding.yaml to split them three ways:
+
+      KEEP    your records — immigration, payslips, tax forms, offer and
+              relieving letters, certifications, resumes, personal projects
+      LEAVE   company work product and customer data
+      REVIEW  credentials and anything the classifier wasn't sure about
+
+    Only KEEP files are exported, and files are copied (not moved) unless
+    you pass --move. Credentials are never exported under any flag.
+    """
+    _configure_logging(verbose)
+
+    config = _load_config()
+    categories = list(config["categories"].keys())
+    policy = RetentionPolicy.load(OFFBOARD_POLICY_PATH)
+
+    try:
+        policy.validate(categories)
+    except PolicyError as e:
+        console.print(f"[red]Retention policy is out of sync with categories.yaml:[/red]\n  {e}")
+        raise typer.Exit(1)
+
+    if explain:
+        _print_policy(policy)
+        return
+
+    if not target_dir:
+        console.print("[red]Error: TARGET_DIR is required (omit it only with --explain).[/red]")
+        raise typer.Exit(1)
+
+    target = Path(target_dir).expanduser().resolve()
+    if not target.exists() or not target.is_dir():
+        console.print(f"[red]Error: Directory {target_dir} not found.[/red]")
+        raise typer.Exit(1)
+
+    files = _gather_files(target, recursive=recursive, category_names=set(categories))
+    scope = "recursively" if recursive else "at top level"
+    console.print(f"[cyan]Found {len(files)} files {scope} in {target}.[/cyan]")
+    if not files:
+        console.print("[yellow]Nothing to do.[/yellow]")
+        return
+
+    plan = _run_local(files=files, config=config, no_ai=no_ai)
+    buckets = policy.partition(plan)
+
+    console.rule("[bold blue]Offboarding Split")
+    _print_disposition(buckets, policy)
+
+    destination = Path(export_to).expanduser().resolve()
+    result = policy.export(plan, destination, apply=apply, move=move)
+
+    console.rule()
+    verb = "Moved" if move else "Copied"
+    if apply:
+        console.print(f"[bold green]{verb} {result.count} files into {destination}[/bold green]")
+        for err in result.errors:
+            console.print(f"[red]Error:[/red] {err}")
+    else:
+        console.print(
+            f"[yellow]Dry-run: {result.count} files would be "
+            f"{'moved' if move else 'copied'} into {destination}.[/yellow]"
+        )
+        console.print("[dim]Re-run with --apply to write the bundle.[/dim]")
+
+    review = buckets[Disposition.REVIEW]
+    if review:
+        console.print(
+            f"\n[bold yellow]⚠ {len(review)} file(s) need your decision — "
+            "nothing was done with them.[/bold yellow]"
+        )
+        secrets = [p for p, c in review if c in policy.never_export]
+        if secrets:
+            console.print(
+                "[red]Credential-bearing files detected. These are never exported.\n"
+                "Rotate or destroy them rather than taking copies:[/red]"
+            )
+            for p in secrets[:10]:
+                console.print(f"    [red]{Path(p).name}[/red]")
+            if len(secrets) > 10:
+                console.print(f"    [red]... +{len(secrets) - 10} more[/red]")
+
+
+def _print_policy(policy: RetentionPolicy) -> None:
+    table = Table(title="Offboarding retention policy")
+    table.add_column("Disposition", style="bold")
+    table.add_column("Categories")
+    styles = {Disposition.KEEP: "green", Disposition.LEAVE: "red", Disposition.REVIEW: "yellow"}
+    for disp in Disposition:
+        cats = sorted(c for c, d in policy.by_category.items() if d is disp)
+        table.add_row(f"[{styles[disp]}]{disp.value.upper()}[/{styles[disp]}]", "\n".join(cats))
+    console.print(table)
+    if policy.never_export:
+        console.print(
+            "[red]Never exported under any flag:[/red] " + ", ".join(sorted(policy.never_export))
+        )
+
+
+def _print_disposition(buckets: dict, policy: RetentionPolicy) -> None:
+    styles = {Disposition.KEEP: "green", Disposition.LEAVE: "red", Disposition.REVIEW: "yellow"}
+    blurb = {
+        Disposition.KEEP: "your records — exported",
+        Disposition.LEAVE: "company / customer property — left behind",
+        Disposition.REVIEW: "needs your decision — untouched",
+    }
+    for disp in Disposition:
+        entries = buckets[disp]
+        colour = styles[disp]
+        console.print(
+            f"\n[bold {colour}]{disp.value.upper()}[/bold {colour}] "
+            f"({len(entries)} files — {blurb[disp]})"
+        )
+        by_cat: dict[str, int] = {}
+        for _, cat in entries:
+            by_cat[cat] = by_cat.get(cat, 0) + 1
+        for cat, n in sorted(by_cat.items(), key=lambda x: -x[1]):
+            flag = "  [red](never exported)[/red]" if cat in policy.never_export else ""
+            console.print(f"    {cat}: {n}{flag}")
 
 
 @app.command(name="check-rules")

@@ -1,0 +1,51 @@
+# Offboarding retention policy.
+#
+# Maps each category to a disposition when you leave an employer. This is a
+# policy layer *over* config/categories.yaml — it does not re-classify
+# anything, it only decides what each already-classified file means for you.
+#
+#   keep    Your own records. Exported to the offboarding bundle.
+#   leave   Company or customer property. Never exported.
+#   review  Needs a human decision before anything happens.
+#
+# Every category in categories.yaml must appear in exactly one list;
+# `smartsort offboard --explain` fails loudly if one is missing, so adding a
+# category later can't silently default to the wrong side.
+
+dispositions:
+  # ---------------------------------------------------------------- KEEP
+  # Documents that are yours: issued to you, about you, or created by you
+  # outside the scope of your employment.
+  keep:
+    - Canadian_PR_Docs          # immigration file — yours, and time-critical
+    - Employment_Records        # offer/transfer/relieving letters, resignation
+    - Certifications_Training   # credentials you personally earned
+    - Financial_Taxes           # payslips, T4s, bank statements, bills
+    - Resumes_Career_Tech       # your CVs and portfolios
+    - Medical_Health            # personal health records
+    - Travel_Transit            # personal travel
+    - AstroQuant_Sidereal       # personal side project
+    - Franchise_Business_Research  # personal research
+    - Media_Images              # personal photos and screenshots
+
+  # ---------------------------------------------------------------- LEAVE
+  # Company work product and third-party data. Deliberately excluded from
+  # the export bundle — this is the "everything except the work I did here"
+  # half of the split.
+  leave:
+    - Guidewire_PSE_Work        # tickets, logs, platform specs, internal comms
+    - Customer_Data             # customer SAML/SSO configs — third-party data
+    - Archives_and_Apps         # installers and build artifacts; re-downloadable
+    - System_Junk               # OS cruft
+
+  # ---------------------------------------------------------------- REVIEW
+  # Never moved automatically. Listed so you can act on them deliberately.
+  review:
+    - Credentials_Secrets       # rotate/destroy — do not copy off the estate
+    - Unknown_Unsorted          # classifier had no confident answer
+
+# Categories whose files must never be written into the export bundle even
+# if a future edit mistakenly lists them under `keep`. A second, independent
+# guard so a one-line policy typo cannot exfiltrate secrets.
+never_export:
+  - Credentials_Secrets

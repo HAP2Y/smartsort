@@ -44,6 +44,28 @@ HIGH_CONFIDENCE_PATTERNS: list[tuple[str, str, str]] = [
     (r'\bpolice clearance\b', 'Canadian_PR_Docs', "Police clearance certificate"),
     (r'\bpermanent resident\b', 'Canadian_PR_Docs', "Permanent resident document"),
     (r'^pr\b', 'Canadian_PR_Docs', "Filename prefix 'PR_' indicates PR document"),
+    # HR paperwork issued TO the employee. These must outrank the employer
+    # keyword (`guidewire`, `gw`, ...) or a file like
+    # "Guidewire Mail - Resignation - Happy Patel.pdf" is read as company work
+    # product and left behind during offboarding — losing the employee a
+    # record they are entitled to and may need for a visa or a future role.
+    (r'\bresignation\b', 'Employment_Records', "Resignation letter (employee's own HR record)"),
+    (r'\boffer of employment\b', 'Employment_Records', "Offer of employment"),
+    (r'\boffer letter\b', 'Employment_Records', "Offer letter"),
+    (r'\brelieving letter\b', 'Employment_Records', "Relieving letter"),
+    (r'\bexperience (letter|certificate)\b', 'Employment_Records', "Experience certificate"),
+    (r'\bservice certificate\b', 'Employment_Records', "Service certificate"),
+    (r'\binternational transfer\b', 'Employment_Records', "International transfer letter"),
+    (r'\bflex work\b', 'Employment_Records', "Flex work letter (HR record, not work product)"),
+    (r'\b(offboarding|onboarding) (checklist|pack|document)\b', 'Employment_Records',
+     "Onboarding/offboarding paperwork"),
+    # Credentials never travel. Matched high-confidence so they can never be
+    # swept into an export bundle by a keyword or an over-confident model.
+    (r'\brecovery codes\b', 'Credentials_Secrets', "2FA recovery codes"),
+    (r'\baccess ?keys?\b', 'Credentials_Secrets', "Access keys"),
+    # Note: patterns match the *tokenised* filename, where underscores have
+    # already become spaces — so this is "id rsa", not "id_rsa".
+    (r'\bid rsa\b', 'Credentials_Secrets', "Private SSH key"),
     # Canadian pay slips are PR proof-of-employment; every other pay slip is
     # just personal finance. This pair MUST stay in this order — the list is
     # first-match-wins, so the generic rule below would otherwise swallow

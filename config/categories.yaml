@@ -89,29 +89,119 @@ categories:
       - bug
       - defect
       - stacktrace
+      - log
       - logs
+      - "acceptable use"
+      - "enterprise policy"
       - okta
       - zurichci
       - liberty-corp
       - uplift
-      - "flex work"
+      # NOTE: "flex work" moved to Employment_Records — a Flex Work Letter is
+      # HR paperwork issued to the employee, not company work product.
       - jutro
       - aviva
+
+  # YOUR OWN employment paperwork — the records an employer issues *to you*
+  # and that you are entitled to keep: offer letters, transfer letters,
+  # verification letters, payslip cover notes, resignation, relieving and
+  # experience certificates, onboarding/offboarding paperwork.
+  #
+  # This is deliberately distinct from Guidewire_PSE_Work, which is the
+  # company's work product. The offboarding split treats this category as
+  # KEEP and Guidewire_PSE_Work as LEAVE.
+  Employment_Records:
+    extensions: [.pdf, .docx, .eml, .msg, .txt]
+    keywords:
+      - "offer of employment"
+      - "offer letter"
+      - "employment agreement"
+      - "employment contract"
+      - "international transfer"
+      - "transfer letter"
+      - "flex work"
+      - "relieving letter"
+      - "experience letter"
+      - "experience certificate"
+      - "service certificate"
+      - resignation
+      - onboarding
+      - offboarding
+      - "background check"
+      - "last working day"
+      - "notice period"
+      - separation
+      - "exit formalities"
+      - appraisal
+      - "performance review"
+      - promotion
+      - "compensation review"
+      - "salary revision"
+      - rsu
+      - "stock options"
+      - "equity grant"
+
+  # Credentials earned by you personally — these travel with you.
+  Certifications_Training:
+    extensions: [.pdf, .png, .jpg]
+    keywords:
+      - certificate
+      - certification
+      - certified
+      - ckad
+      - cka
+      - coursera
+      - udemy
+      - "course completion"
+      - "training completion"
+      - accreditation
+
+  # NEVER auto-moved. Surfaced for rotation/destruction, not relocation.
+  # Company infrastructure secrets must not travel off the company's estate;
+  # personal 2FA recovery codes should be regenerated rather than copied.
+  Credentials_Secrets:
+    extensions: [.txt, .csv, .json, .pem, .key, .p12, .pfx, .keystore, .cer]
+    keywords:
+      - "recovery codes"
+      - "access key"
+      - accesskeys
+      - credentials
+      - password
+      - passphrase
+      - secret
+      - apikey
+      - "api key"
+      - keystore
+      - truststore
+      - "private key"
+      - id_rsa
+
+  # Third-party customer configuration (SAML/SSO metadata, tenant configs).
+  # Not yours and not merely "your work" — this is customer data and must
+  # stay on the company's estate.
+  Customer_Data:
+    extensions: [.xml, .json, .csv]
+    keywords:
+      - "customer metadata"
+      - "customer-metadata"
+      - saml
+      - idp
+      - sso
+      - "identity provider"
+      - "service provider"
+      - tenant
 
   Resumes_Career_Tech:
     extensions: [.pdf, .docx, .pptx]
     keywords:
       - resume
       - cv
-      - offer
       - interview
       - "cover letter"
-      - certification
       - portfolio
       - "software engineer"
       - developer
       - sde
-      - ckad
       - linkedin
 
   Financial_Taxes:
@@ -132,6 +222,15 @@ categories:
       - invoice
       - "credit card"
       - jio
+      - tax
+      - taxes
+      - "tax forms"
+      - "income tax"
+      - "notice of assessment"
+      - "proof of income"
+      - payslip
+      - payslips
+      - salary
 
   Medical_Health:
     extensions: [.pdf, .docx, .jpg, .eml]
