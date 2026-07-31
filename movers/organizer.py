@@ -30,7 +30,7 @@ class Organizer:
 
         for filepath, data in classification_plan.items():
             category = data['category']
-            if category in ("Unknown_Unsorted", "Metadata_System"):
+            if category in ("Unknown_Unsorted", "System_Junk"):
                 continue
 
             dest_dir = os.path.join(self.target_dir, category)

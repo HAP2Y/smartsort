@@ -62,14 +62,28 @@ class Router:
         return self.default_route
 
     @classmethod
-    def default(cls) -> "Router":
-        return cls(
-            rules=[
+    def default(cls, enable_ocr: bool = False) -> "Router":
+        """Build the standard route table.
+
+        ``enable_ocr`` defaults to **False** because no OCR worker ships yet.
+        With it off, images fall through to ``ROUTE_UNROUTABLE`` and the
+        dispatcher's ``Prefilter`` classifies them from their filenames —
+        which handles ``Screenshot*.png`` and ``screencapture-*.png`` well.
+        Enqueueing them to an OCR queue nobody drains just guarantees a
+        timeout: every image would burn the full ``--timeout`` and still come
+        back Unknown.
+        """
+        rules: list[RouteRule] = []
+        if enable_ocr:
+            rules.append(
                 RouteRule(
                     route=ROUTE_OCR,
                     predicate=lambda f, _s: f.ext in IMAGE_EXTS,
                     note="Images need OCR before any LLM can read them.",
-                ),
+                )
+            )
+        return cls(
+            rules=rules + [
                 RouteRule(
                     route=ROUTE_AI_LARGE,
                     predicate=lambda f, s: f.ext in EXTRACTABLE_EXTS and s >= LARGE_FILE_BYTES,

@@ -34,7 +34,7 @@ def test_route_counts_tallies_each_queue(tmp_path):
     img = _make_file(tmp_path / "scan.png", 1024)
     misc = _make_file(tmp_path / "weird.bin", 1024)
 
-    counts = _route_counts([small, big, img, misc], Router.default())
+    counts = _route_counts([small, big, img, misc], Router.default(enable_ocr=True))
 
     # Unmatched files now route to UNROUTABLE (Unknown locally on dispatcher).
     assert counts == {

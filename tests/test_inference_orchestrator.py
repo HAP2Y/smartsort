@@ -68,7 +68,7 @@ def test_orchestrator_round_trip(tmp_path):
         ROUTE_OCR: "ocr-stub",
     })
 
-    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    orchestrator = Orchestrator(backend=backend, router=Router.default(enable_ocr=True))
     pending = orchestrator.submit([small, large, img, misc])
 
     assert orchestrator.stats.submitted == 4
@@ -96,7 +96,7 @@ def test_orchestrator_times_out_without_workers(tmp_path):
     f = tmp_path / "a.pdf"
     f.write_bytes(b"x" * 1024)
     backend = InMemoryQueueBackend()
-    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    orchestrator = Orchestrator(backend=backend, router=Router.default(enable_ocr=True))
     pending = orchestrator.submit([f])
 
     started = time.time()
@@ -135,7 +135,7 @@ def test_orchestrator_invokes_on_result_callback(tmp_path):
     def cb(result, classification):
         seen.append((result.file_path, classification.category))
 
-    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    orchestrator = Orchestrator(backend=backend, router=Router.default(enable_ocr=True))
     pending = orchestrator.submit([f1, f2])
     orchestrator.collect(pending, timeout=5.0, poll=0.1, on_result=cb)
 
@@ -164,7 +164,7 @@ def test_orchestrator_ignores_stray_results(tmp_path):
     ))
 
     workers = _spin_workers(backend, {ROUTE_UNROUTABLE: "rules"})
-    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    orchestrator = Orchestrator(backend=backend, router=Router.default(enable_ocr=True))
     pending = orchestrator.submit([f])
     plan = orchestrator.collect(pending, timeout=5.0, poll=0.1)
 
@@ -199,7 +199,7 @@ def test_orchestrator_handles_malformed_classification(tmp_path):
         classification={"missing_fields": True},
     ))
 
-    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    orchestrator = Orchestrator(backend=backend, router=Router.default(enable_ocr=True))
     # Inject the pending job directly so collect() has the expected id.
     pending = {job.id: job}
     plan = orchestrator.collect(pending, timeout=2.0, poll=0.1)
@@ -219,7 +219,7 @@ def test_orchestrator_handles_worker_error_field(tmp_path):
         worker_id="w", duration_ms=1.0, error="RuntimeError: boom",
     ))
 
-    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    orchestrator = Orchestrator(backend=backend, router=Router.default(enable_ocr=True))
     plan = orchestrator.collect({job.id: job}, timeout=2.0, poll=0.1)
 
     assert plan[str(f)].category == "Unknown_Unsorted"
@@ -237,7 +237,7 @@ def test_orchestrator_by_route_stats_track_each_queue(tmp_path):
         files.append(p)
 
     backend = InMemoryQueueBackend()
-    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    orchestrator = Orchestrator(backend=backend, router=Router.default(enable_ocr=True))
     orchestrator.submit(files)
 
     assert orchestrator.stats.submitted == 4
@@ -248,7 +248,7 @@ def test_orchestrator_by_route_stats_track_each_queue(tmp_path):
 
 def test_orchestrator_submit_with_empty_files_is_a_noop():
     backend = InMemoryQueueBackend()
-    orchestrator = Orchestrator(backend=backend, router=Router.default())
+    orchestrator = Orchestrator(backend=backend, router=Router.default(enable_ocr=True))
     pending = orchestrator.submit([])
 
     assert pending == {}

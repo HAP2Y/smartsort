@@ -29,9 +29,15 @@ categories:
       - imm5644e
 
   AstroQuant_Sidereal:
-    extensions: [.csv, .xlsx, .json, .py, .ipynb, .txt, .tar.gz]
+    # NOTE: extensions are a hard filter — a category can only match a file
+    # whose extension is listed here. Most astro artifacts are .html
+    # dashboards, .md specs and .zip run-outputs, so those must be present
+    # or the keywords below can never fire.
+    # (.tar.gz is NOT a valid entry: Path('x.tar.gz').suffix == '.gz'.)
+    extensions: [.csv, .xlsx, .json, .py, .ipynb, .txt, .md, .html, .zip, .docx, .gz]
     keywords:
       - astro
+      - astrocycle
       - quant
       - backtest
       - trading
@@ -42,6 +48,11 @@ categories:
       - ephemeris
       - planet
       - sidereal
+      - celestial
+      - cosmic
+      - vedic
+      - sequencer
+      - "ticker signal"
       - strategy
       - ohlc
       - signals
@@ -163,6 +174,7 @@ categories:
     extensions: [.jpg, .jpeg, .png, .gif, .mp4, .mov]
     keywords:
       - screenshot
+      - screencapture
       - image
       - photo
       - pxl
@@ -175,8 +187,15 @@ categories:
       - app
       - setup
 
-  Metadata_System:
-    extensions: [.ds_store, .tmp, .cache, .log, .localized, .cer]
+  # Renamed from Metadata_System: the old name lured the LLM into filing
+  # SAML `*-metadata.xml` documents here (observed at 95% confidence) when
+  # they belong in Guidewire_PSE_Work. Name the bucket after what it holds
+  # — OS cruft — not after a word that appears in real document filenames.
+  # `.log` is deliberately NOT listed: it collides with Guidewire_PSE_Work
+  # and the system-file check short-circuits first, which mis-filed
+  # DigitalPortals_Test_2469.log as system junk.
+  System_Junk:
+    extensions: [.ds_store, .tmp, .cache, .localized, .cer]
     keywords:
       - gitignore
 

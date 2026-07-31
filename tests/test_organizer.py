@@ -53,7 +53,7 @@ def test_apply_skips_unknown_and_metadata(tmp_path):
     org = Organizer(str(tmp_path), category_names=CATEGORIES)
     plan = {
         str(f1): {"category": "Unknown_Unsorted", "confidence": 0, "method": "n", "reason": "r"},
-        str(f2): {"category": "Metadata_System", "confidence": 100, "method": "n", "reason": "r"},
+        str(f2): {"category": "System_Junk", "confidence": 100, "method": "n", "reason": "r"},
     }
     org.move_files(plan, apply=True)
     assert f1.exists() and f2.exists()  # nothing moved

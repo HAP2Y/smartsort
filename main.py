@@ -127,8 +127,10 @@ def run(
         help="Inline workers per route (memory backend only). Use 0 with redis to defer to external workers.",
     ),
     timeout: float = typer.Option(
-        300.0, "--timeout",
-        help="Max seconds to wait for distributed results before filling Unknown_Unsorted.",
+        900.0, "--timeout",
+        help="Max seconds to wait for distributed results before filling Unknown_Unsorted. "
+             "Budget ~3-4s per file per worker: 200 files over 4 workers needs ~200s, "
+             "but a cold Ollama model load can add a minute on the first call.",
     ),
     up: bool = typer.Option(
         False, "--up",
@@ -378,26 +380,38 @@ def _run_distributed(
         tail_compose_logs,
     )
     from inference.router import ROUTE_UNROUTABLE
+    from inference.prefilter import Prefilter
     from classifier.ai_local import DEFAULT_OLLAMA_URL
 
     backend_kwargs = {"url": redis_url} if backend == "redis" else {}
     qb = build_backend(backend, **backend_kwargs)
     router = Router.default()
 
-    # -------------------- Pre-route locally so unroutable files (e.g.
-    # images without an OCR worker) get a clean "Unknown" verdict instead
-    # of being enqueued to a queue that nobody drains.
+    # -------------------- Pre-route locally. Files no worker can read
+    # (archives, installers, spreadsheets, extensionless files, and images
+    # while there is no OCR worker) are classified here by filename rules
+    # rather than being stamped Unknown or enqueued to a queue nobody
+    # drains. AI-first is preserved for everything a worker *can* read.
+    prefilter = Prefilter(RulesEngine(str(CONFIG_PATH)))
     plan: dict[str, Classification] = {}
     enqueueable: list[Path] = []
+    prefiltered_hits = 0
     for path in files:
-        route = router.route(FileItem(path=path))
+        item = FileItem(path=path)
+        route = router.route(item)
         if route == ROUTE_UNROUTABLE:
-            plan[str(path)] = Classification.unknown(
-                reason="no AI / OCR worker available for this file type",
-                method="Router",
-            )
+            verdict = prefilter.classify(item)
+            plan[str(path)] = verdict
+            if verdict.is_known:
+                prefiltered_hits += 1
         else:
             enqueueable.append(path)
+
+    if plan:
+        console.print(
+            f"[cyan]Prefilter handled {len(plan)} non-worker files "
+            f"({prefiltered_hits} classified, {len(plan) - prefiltered_hits} unknown).[/cyan]"
+        )
 
     if not enqueueable:
         console.print("[cyan]No files require worker processing.[/cyan]")
@@ -608,13 +622,25 @@ def _model_for_route(config: dict, route: str, override: str | None = None) -> s
 def _build_worker_classifier(route: str, config: dict, model_override: str | None):
     """Pick the right classifier for a given queue route.
 
-    Pipeline order is **AI first**, rules as a fallback. The previous
-    order (HC-rules → AI → rules) meant every file with a familiar
-    keyword in its name short-circuited the LLM, so the AI fleet was
-    expensive plumbing that almost never ran. Now the LLM gets to weigh
-    in on every file the dispatcher hands it; rules only catch the
-    cases where the LLM declines (no extractable text, output not in
-    the allowed category set, confidence below threshold).
+    Order is **HC-rules → AI → keyword-rules**, which splits the difference
+    between the two previous designs.
+
+    Going fully rules-first starved the LLM: any file with a familiar
+    keyword short-circuited it, so the AI fleet was expensive plumbing that
+    rarely ran. But going fully AI-first put the LLM ahead of markers that
+    are true *by definition*, and it lost to them. Observed in one run: the
+    sector-ETF exports split across two categories because the model reads
+    ``Date,Open,High,Low,Close,Volume`` as generic finance — xlc/xle landed
+    in AstroQuant while xlb/xlf/xlp/xlu landed in Financial_Taxes. Same for
+    ``PATEL_CAN_PAY_SLIP_*``, where the model contradicted the project's own
+    pay-slip rule.
+
+    ``HighConfidenceRulesClassifier`` is a deliberately small, curated regex
+    list (IMM form numbers, T4, PCC, ticker filenames) — cases where a
+    filename is definitional and a 7B model second-guessing it is strictly
+    worse. It matches a small minority of files, so the LLM still sees the
+    bulk of the corpus. ``RulesClassifier`` (fuzzy keyword matching) stays
+    *behind* the AI, which is what the AI-first change was really protecting.
     """
     rules = RulesEngine(str(CONFIG_PATH))
     categories = list(config["categories"].keys())
@@ -625,8 +651,8 @@ def _build_worker_classifier(route: str, config: dict, model_override: str | Non
         ai = LocalAIClassifier(model=model)
         extractor = FileExtractor(max_chars=config["settings"]["max_extract_chars"])
         return ClassificationPipeline([
+            HighConfidenceRulesClassifier(rules),  # definitional filename markers win outright
             LocalAIPipelineClassifier(ai, extractor, categories, threshold, enabled=True),
-            HighConfidenceRulesClassifier(rules),  # safety net: unambiguous filename markers
             RulesClassifier(rules),                # last resort: keyword + extension fallback
         ])
     if route in (ROUTE_RULES, ROUTE_OCR):
