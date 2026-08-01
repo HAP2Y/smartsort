@@ -251,3 +251,51 @@ def test_export_suffixes_name_collisions(tmp_path, classify, policy):
     assert result.count == 2
     names = sorted(p.name for p in (dest / "Canadian_PR_Docs").iterdir())
     assert names == ["Happy_imm5476e_Signed.pdf", "Happy_imm5476e_Signed_1.pdf"]
+
+
+# ------------------------------------------------------------------ manifest
+
+
+def test_manifest_covers_every_disposition(tmp_path, classify, policy):
+    """The manifest is an audit trail: it must record what was LEFT and what
+    needs REVIEW, not only what was exported."""
+    from main import _write_manifest
+    import csv as _csv
+
+    names = [
+        "Happy_imm5476e_Signed.pdf",           # keep
+        "CPIKOR-CORP-Customer-metadata.xml",   # leave
+        "github-recovery-codes.txt",           # review / never exported
+        "Print.pdf",                           # review / unknown
+    ]
+    plan = _plan(tmp_path, names, classify)
+    dest = tmp_path / "bundle"
+    dest.mkdir()
+    path = _write_manifest(plan, policy, dest, None, apply=True)
+
+    assert path is not None and path.exists()
+    rows = list(_csv.DictReader(open(path)))
+    assert len(rows) == len(names)
+
+    by_name = {r["filename"]: r for r in rows}
+    assert by_name["Happy_imm5476e_Signed.pdf"]["disposition"] == "keep"
+    assert by_name["Happy_imm5476e_Signed.pdf"]["exported"] == "yes"
+    assert by_name["CPIKOR-CORP-Customer-metadata.xml"]["disposition"] == "leave"
+    assert by_name["CPIKOR-CORP-Customer-metadata.xml"]["exported"] == "no"
+    # A credential is never marked exported even though it is listed.
+    assert by_name["github-recovery-codes.txt"]["exported"] == "no"
+    assert by_name["Print.pdf"]["disposition"] == "review"
+
+
+def test_manifest_not_written_on_dry_run_without_explicit_path(tmp_path, classify, policy):
+    from main import _write_manifest
+    plan = _plan(tmp_path, ["Happy_imm5476e_Signed.pdf"], classify)
+    assert _write_manifest(plan, policy, tmp_path / "bundle", None, apply=False) is None
+
+
+def test_manifest_honours_explicit_path_on_dry_run(tmp_path, classify, policy):
+    from main import _write_manifest
+    plan = _plan(tmp_path, ["Happy_imm5476e_Signed.pdf"], classify)
+    target = tmp_path / "audit" / "report.csv"
+    path = _write_manifest(plan, policy, tmp_path / "bundle", str(target), apply=False)
+    assert path == target.resolve() and target.exists()

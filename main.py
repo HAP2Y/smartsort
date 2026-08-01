@@ -1,6 +1,7 @@
 """SmartSort CLI entry point."""
 from __future__ import annotations
 
+import csv
 import logging
 from pathlib import Path
 from typing import Iterable
@@ -565,6 +566,11 @@ def offboard(
     no_ai: bool = typer.Option(False, "--no-ai", help="Rules only, skip the LLM."),
     recursive: bool = typer.Option(False, "--recursive", "-r", help="Recurse into subdirectories."),
     explain: bool = typer.Option(False, "--explain", help="Print the retention policy and exit."),
+    manifest: str = typer.Option(
+        None, "--manifest",
+        help="Write a CSV audit trail of every file and its disposition. "
+             "Defaults to <export-to>/manifest.csv when --apply is used.",
+    ),
     verbose: int = typer.Option(0, "--verbose", "-v", count=True),
 ):
     """Separate your own records from the company's work product.
@@ -634,22 +640,84 @@ def offboard(
         )
         console.print("[dim]Re-run with --apply to write the bundle.[/dim]")
 
+    manifest_path = _write_manifest(plan, policy, destination, manifest, apply)
+    if manifest_path:
+        console.print(f"[dim]Manifest: {manifest_path}[/dim]")
+
     review = buckets[Disposition.REVIEW]
     if review:
         console.print(
             f"\n[bold yellow]⚠ {len(review)} file(s) need your decision — "
-            "nothing was done with them.[/bold yellow]"
+            "nothing was done with them. They remain in the source folder.[/bold yellow]"
         )
+        # Counts alone are not actionable: you cannot decide about a file you
+        # cannot name. List every REVIEW file, secrets first.
         secrets = [p for p, c in review if c in policy.never_export]
+        others = [p for p, c in review if c not in policy.never_export]
+
         if secrets:
             console.print(
-                "[red]Credential-bearing files detected. These are never exported.\n"
-                "Rotate or destroy them rather than taking copies:[/red]"
+                "\n[red]Credential-bearing — never exported. Rotate or destroy "
+                "rather than taking copies:[/red]"
             )
-            for p in secrets[:10]:
+            for p in sorted(secrets):
                 console.print(f"    [red]{Path(p).name}[/red]")
-            if len(secrets) > 10:
-                console.print(f"    [red]... +{len(secrets) - 10} more[/red]")
+
+        if others:
+            console.print(
+                f"\n[yellow]Unclassified ({len(others)}) — the classifier had no "
+                "confident answer. Check these by hand:[/yellow]"
+            )
+            for p in sorted(others):
+                console.print(f"    {Path(p).name}")
+
+
+def _write_manifest(
+    plan: dict[str, Classification],
+    policy: RetentionPolicy,
+    destination: Path,
+    manifest: str | None,
+    apply: bool,
+) -> Path | None:
+    """Write a full audit trail of every file and what happened to it.
+
+    Offboarding is exactly the situation where you may later need to show
+    what you took and what you left, so the manifest covers all three
+    dispositions rather than only the exported set.
+    """
+    if manifest:
+        path = Path(manifest).expanduser().resolve()
+    elif apply:
+        path = destination / "manifest.csv"
+    else:
+        return None
+
+    rows = []
+    for filepath, c in plan.items():
+        disp = policy.disposition(c.category)
+        exported = disp is Disposition.KEEP and policy.is_exportable(c.category)
+        rows.append({
+            "disposition": disp.value,
+            "exported": "yes" if (exported and apply) else "no",
+            "category": c.category,
+            "confidence": c.confidence,
+            "method": c.method,
+            "filename": Path(filepath).name,
+            "source_path": filepath,
+            "reason": c.reason,
+        })
+    rows.sort(key=lambda r: (r["disposition"], r["category"], r["filename"]))
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["disposition"])
+            writer.writeheader()
+            writer.writerows(rows)
+    except OSError as e:
+        console.print(f"[red]Could not write manifest:[/red] {e}")
+        return None
+    return path
 
 
 def _print_policy(policy: RetentionPolicy) -> None:
