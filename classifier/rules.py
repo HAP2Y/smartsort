@@ -44,8 +44,43 @@ HIGH_CONFIDENCE_PATTERNS: list[tuple[str, str, str]] = [
     (r'\bpolice clearance\b', 'Canadian_PR_Docs', "Police clearance certificate"),
     (r'\bpermanent resident\b', 'Canadian_PR_Docs', "Permanent resident document"),
     (r'^pr\b', 'Canadian_PR_Docs', "Filename prefix 'PR_' indicates PR document"),
-    (r'\bpay slip\b', 'Financial_Taxes', "Pay slip"),
+    # HR paperwork issued TO the employee. These must outrank the employer
+    # keyword (`guidewire`, `gw`, ...) or a file like
+    # "Guidewire Mail - Resignation - Happy Patel.pdf" is read as company work
+    # product and left behind during offboarding — losing the employee a
+    # record they are entitled to and may need for a visa or a future role.
+    (r'\bresignation\b', 'Employment_Records', "Resignation letter (employee's own HR record)"),
+    (r'\boffer of employment\b', 'Employment_Records', "Offer of employment"),
+    (r'\boffer letter\b', 'Employment_Records', "Offer letter"),
+    (r'\brelieving letter\b', 'Employment_Records', "Relieving letter"),
+    (r'\bexperience (letter|certificate)\b', 'Employment_Records', "Experience certificate"),
+    (r'\bservice certificate\b', 'Employment_Records', "Service certificate"),
+    (r'\binternational transfer\b', 'Employment_Records', "International transfer letter"),
+    (r'\bflex work\b', 'Employment_Records', "Flex work letter (HR record, not work product)"),
+    (r'\b(offboarding|onboarding) (checklist|pack|document)\b', 'Employment_Records',
+     "Onboarding/offboarding paperwork"),
+    # Credentials never travel. Matched high-confidence so they can never be
+    # swept into an export bundle by a keyword or an over-confident model.
+    (r'\brecovery codes\b', 'Credentials_Secrets', "2FA recovery codes"),
+    (r'\baccess ?keys?\b', 'Credentials_Secrets', "Access keys"),
+    # Note: patterns match the *tokenised* filename, where underscores have
+    # already become spaces — so this is "id rsa", not "id_rsa".
+    (r'\bid rsa\b', 'Credentials_Secrets', "Private SSH key"),
+    # Canadian pay slips are PR proof-of-employment; every other pay slip is
+    # just personal finance. This pair MUST stay in this order — the list is
+    # first-match-wins, so the generic rule below would otherwise swallow
+    # PATEL_CAN_PAY_SLIP_* and contradict prompt rule 1 in ai_local.py.
+    (r'\bcan (first )?pay slip\b', 'Canadian_PR_Docs', "Canadian pay slip used as PR proof"),
+    (r'\bpay ?slip\b', 'Financial_Taxes', "Pay slip"),
     (r'\bbalance certificate\b', 'Financial_Taxes', "Bank balance certificate"),
+    # Sector-ETF / index OHLC exports for the astro-quant project. These are
+    # high-confidence because the AI reliably reads their
+    # "Date,Open,High,Low,Close,Volume" header as generic finance and files
+    # them under Financial_Taxes — observed splitting xlc/xle (rules) from
+    # xlb/xlf/xlp/xlu (AI) inside a single run. Rules only beat the AI from
+    # this list, so ticker files have to live here rather than in keywords.
+    (r'^xl[a-z]{1,2} csv$', 'AstroQuant_Sidereal', "Sector ETF ticker OHLC export"),
+    (r'^(nfty|nifty|banknifty|spy|qqq) csv$', 'AstroQuant_Sidereal', "Index ticker OHLC export"),
 ]
 
 
@@ -99,10 +134,10 @@ class RulesEngine:
         ext = os.path.splitext(filename)[1].lower()
 
         # 1. System / hidden files
-        meta_exts = self.categories.get('Metadata_System', {}).get('extensions', [])
+        meta_exts = self.categories.get('System_Junk', {}).get('extensions', [])
         if ext in meta_exts or filename.startswith('.'):
             return Classification(
-                category="Metadata_System",
+                category="System_Junk",
                 confidence=100,
                 method=self.KEYWORD_METHOD,
                 reason="System/Hidden file detected by extension",

@@ -303,6 +303,53 @@ Categories live in `config/categories.yaml`. Adding a new classification source 
 
 ---
 
+## Offboarding mode
+
+When you leave an employer, a Downloads folder tangles two things together: records that are **yours** (immigration paperwork, payslips, tax forms, offer and relieving letters, certifications, personal projects) and the employer's **work product** plus its customers' data.
+
+`smartsort offboard` classifies everything, then applies the retention policy in `config/offboarding.yaml` to split the results three ways:
+
+| Disposition | Meaning | Action |
+| --- | --- | --- |
+| **KEEP** | Your records | Exported to the bundle |
+| **LEAVE** | Company work product, customer data | Never exported |
+| **REVIEW** | Credentials, low-confidence results | Untouched, listed for you |
+
+```bash
+smartsort offboard --explain              # print the policy, change nothing
+smartsort offboard ~/Downloads            # dry-run: show the split
+smartsort offboard ~/Downloads --apply    # write the KEEP bundle
+smartsort offboard ~/Downloads --apply --move        # move instead of copy
+smartsort offboard ~/Downloads --apply --export-to ~/Desktop/MyRecords
+```
+
+The bundle is organised by category:
+
+```
+Offboarding_Bundle/
+  Canadian_PR_Docs/      IMM5787_*.pdf, Patel_Happy_2022-2023_T4.pdf, ...
+  Employment_Records/    Offer of Employment, Transfer Letter, Resignation, ...
+  Financial_Taxes/       payslips, tax forms, proof of income, statements
+  Resumes_Career_Tech/   your CVs
+  Medical_Health/  Travel_Transit/  AstroQuant_Sidereal/  ...
+```
+
+### Safety properties
+
+**Copy, not move, by default.** Originals stay put until you have verified the bundle. `--move` is opt-in.
+
+**Credentials are never exported.** `Credentials_Secrets` (2FA recovery codes, access keys, private keys) is barred by a `never_export` list that is checked *independently* of the disposition — so even a policy edit that mistakenly marks it KEEP cannot write it into the bundle, and `--move` cannot relocate it either. These files are reported so you can rotate or destroy them, which is the correct action; copying credentials off the estate is not.
+
+**Your HR paperwork outranks the employer's name.** A file like `Guidewire Mail - Resignation - Happy Patel.pdf` contains the employer's name, and a naive keyword match files it as company work product — which would leave it behind. Employment-record markers (`resignation`, `offer of employment`, `relieving letter`, `experience certificate`, `international transfer`, `flex work`) are high-confidence rules, so they beat both the employer keyword and the LLM.
+
+**The policy fails closed.** Every category must appear in exactly one disposition list. Add a category to `categories.yaml` without giving it a disposition and `offboard` refuses to run rather than silently defaulting it into KEEP.
+
+### Customising the split
+
+`config/offboarding.yaml` is the whole policy. Move a category between `keep`, `leave` and `review` to change what travels with you — the classifier is untouched, so the same taxonomy can be re-interpreted for a different employer or jurisdiction. Run `smartsort offboard --explain` to see the resulting policy before scanning anything.
+
+---
+
 ## Settings
 
 `config/categories.yaml` is the single source of truth for everything operational.

@@ -49,10 +49,17 @@ CANADIAN_PR_CASES = [
     "Kunal Khosla Employment verification letter.pdf",
     "Employment Verification Letter - with comp details_HappyPatel.pdf",
     "employment_verification_letter_-_with_c.pdf",
+    # Canadian pay slips are PR proof-of-employment. Indian ones (below,
+    # in FINANCIAL_CASES) are ordinary personal finance — the `_CAN_`
+    # marker is what separates them.
+    "PATEL_CAN_PAY_SLIP_JUN_2025.pdf",
+    "PATEL_CAN_FIRST_PAY_SLIP_AUG_2022.pdf",
+    "PATEL_CAN_PAY_SLIP_JUL-DEC_2023-4-9.pdf",
 ]
 
 FINANCIAL_CASES = [
-    "PATEL_CAN_PAY_SLIP_JUN_2025.pdf",
+    "Payslip_May_2026.pdf",
+    "Happy_India_PaySlips_Aug_2025_to_Current.pdf",
     "Patel_Happy_HDFC_BalanceCertificate_269.pdf",
     "CH_BalanceCertificate_269076050.pdf",
     "Mobile Receipt.pdf",
@@ -147,7 +154,7 @@ def test_archives(rules, name):
 @pytest.mark.parametrize("name", METADATA_CASES)
 def test_metadata(rules, name):
     cat, *_ = _classify(rules, name)
-    assert cat == "Metadata_System", name
+    assert cat == "System_Junk", name
 
 
 @pytest.mark.parametrize("name", RESUME_CASES)

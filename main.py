@@ -1,6 +1,7 @@
 """SmartSort CLI entry point."""
 from __future__ import annotations
 
+import csv
 import logging
 from pathlib import Path
 from typing import Iterable
@@ -27,9 +28,11 @@ from inference.router import (
     ROUTE_OCR,
     ROUTE_RULES,
 )
+from movers.offboarding import Disposition, PolicyError, RetentionPolicy
 from movers.organizer import Organizer
 
 CONFIG_PATH = Path(__file__).parent / "config" / "categories.yaml"
+OFFBOARD_POLICY_PATH = Path(__file__).parent / "config" / "offboarding.yaml"
 
 app = typer.Typer(help="SmartSort - Local-first file classification & sorting", no_args_is_help=True)
 console = Console()
@@ -127,8 +130,10 @@ def run(
         help="Inline workers per route (memory backend only). Use 0 with redis to defer to external workers.",
     ),
     timeout: float = typer.Option(
-        300.0, "--timeout",
-        help="Max seconds to wait for distributed results before filling Unknown_Unsorted.",
+        900.0, "--timeout",
+        help="Max seconds to wait for distributed results before filling Unknown_Unsorted. "
+             "Budget ~3-4s per file per worker: 200 files over 4 workers needs ~200s, "
+             "but a cold Ollama model load can add a minute on the first call.",
     ),
     up: bool = typer.Option(
         False, "--up",
@@ -378,26 +383,38 @@ def _run_distributed(
         tail_compose_logs,
     )
     from inference.router import ROUTE_UNROUTABLE
+    from inference.prefilter import Prefilter
     from classifier.ai_local import DEFAULT_OLLAMA_URL
 
     backend_kwargs = {"url": redis_url} if backend == "redis" else {}
     qb = build_backend(backend, **backend_kwargs)
     router = Router.default()
 
-    # -------------------- Pre-route locally so unroutable files (e.g.
-    # images without an OCR worker) get a clean "Unknown" verdict instead
-    # of being enqueued to a queue that nobody drains.
+    # -------------------- Pre-route locally. Files no worker can read
+    # (archives, installers, spreadsheets, extensionless files, and images
+    # while there is no OCR worker) are classified here by filename rules
+    # rather than being stamped Unknown or enqueued to a queue nobody
+    # drains. AI-first is preserved for everything a worker *can* read.
+    prefilter = Prefilter(RulesEngine(str(CONFIG_PATH)))
     plan: dict[str, Classification] = {}
     enqueueable: list[Path] = []
+    prefiltered_hits = 0
     for path in files:
-        route = router.route(FileItem(path=path))
+        item = FileItem(path=path)
+        route = router.route(item)
         if route == ROUTE_UNROUTABLE:
-            plan[str(path)] = Classification.unknown(
-                reason="no AI / OCR worker available for this file type",
-                method="Router",
-            )
+            verdict = prefilter.classify(item)
+            plan[str(path)] = verdict
+            if verdict.is_known:
+                prefiltered_hits += 1
         else:
             enqueueable.append(path)
+
+    if plan:
+        console.print(
+            f"[cyan]Prefilter handled {len(plan)} non-worker files "
+            f"({prefiltered_hits} classified, {len(plan) - prefiltered_hits} unknown).[/cyan]"
+        )
 
     if not enqueueable:
         console.print("[cyan]No files require worker processing.[/cyan]")
@@ -531,6 +548,215 @@ def undo(
         console.print(f"[red]Error:[/red] {err}")
 
 
+@app.command()
+def offboard(
+    target_dir: str = typer.Argument(
+        None, help="Directory to scan (e.g. ~/Downloads). Not needed with --explain.",
+    ),
+    export_to: str = typer.Option(
+        "./Offboarding_Bundle", "--export-to",
+        help="Where the KEEP bundle is written, organised by category.",
+    ),
+    apply: bool = typer.Option(False, "--apply", help="Actually write the bundle. Defaults to dry-run."),
+    move: bool = typer.Option(
+        False, "--move",
+        help="Move KEEP files instead of copying. Default is copy, so originals "
+             "stay put until you have verified the bundle.",
+    ),
+    no_ai: bool = typer.Option(False, "--no-ai", help="Rules only, skip the LLM."),
+    recursive: bool = typer.Option(False, "--recursive", "-r", help="Recurse into subdirectories."),
+    explain: bool = typer.Option(False, "--explain", help="Print the retention policy and exit."),
+    manifest: str = typer.Option(
+        None, "--manifest",
+        help="Write a CSV audit trail of every file and its disposition. "
+             "Defaults to <export-to>/manifest.csv when --apply is used.",
+    ),
+    verbose: int = typer.Option(0, "--verbose", "-v", count=True),
+):
+    """Separate your own records from the company's work product.
+
+    Classifies every file, then applies the retention policy in
+    config/offboarding.yaml to split them three ways:
+
+      KEEP    your records — immigration, payslips, tax forms, offer and
+              relieving letters, certifications, resumes, personal projects
+      LEAVE   company work product and customer data
+      REVIEW  credentials and anything the classifier wasn't sure about
+
+    Only KEEP files are exported, and files are copied (not moved) unless
+    you pass --move. Credentials are never exported under any flag.
+    """
+    _configure_logging(verbose)
+
+    config = _load_config()
+    categories = list(config["categories"].keys())
+    policy = RetentionPolicy.load(OFFBOARD_POLICY_PATH)
+
+    try:
+        policy.validate(categories)
+    except PolicyError as e:
+        console.print(f"[red]Retention policy is out of sync with categories.yaml:[/red]\n  {e}")
+        raise typer.Exit(1)
+
+    if explain:
+        _print_policy(policy)
+        return
+
+    if not target_dir:
+        console.print("[red]Error: TARGET_DIR is required (omit it only with --explain).[/red]")
+        raise typer.Exit(1)
+
+    target = Path(target_dir).expanduser().resolve()
+    if not target.exists() or not target.is_dir():
+        console.print(f"[red]Error: Directory {target_dir} not found.[/red]")
+        raise typer.Exit(1)
+
+    files = _gather_files(target, recursive=recursive, category_names=set(categories))
+    scope = "recursively" if recursive else "at top level"
+    console.print(f"[cyan]Found {len(files)} files {scope} in {target}.[/cyan]")
+    if not files:
+        console.print("[yellow]Nothing to do.[/yellow]")
+        return
+
+    plan = _run_local(files=files, config=config, no_ai=no_ai)
+    buckets = policy.partition(plan)
+
+    console.rule("[bold blue]Offboarding Split")
+    _print_disposition(buckets, policy)
+
+    destination = Path(export_to).expanduser().resolve()
+    result = policy.export(plan, destination, apply=apply, move=move)
+
+    console.rule()
+    verb = "Moved" if move else "Copied"
+    if apply:
+        console.print(f"[bold green]{verb} {result.count} files into {destination}[/bold green]")
+        for err in result.errors:
+            console.print(f"[red]Error:[/red] {err}")
+    else:
+        console.print(
+            f"[yellow]Dry-run: {result.count} files would be "
+            f"{'moved' if move else 'copied'} into {destination}.[/yellow]"
+        )
+        console.print("[dim]Re-run with --apply to write the bundle.[/dim]")
+
+    manifest_path = _write_manifest(plan, policy, destination, manifest, apply)
+    if manifest_path:
+        console.print(f"[dim]Manifest: {manifest_path}[/dim]")
+
+    review = buckets[Disposition.REVIEW]
+    if review:
+        console.print(
+            f"\n[bold yellow]⚠ {len(review)} file(s) need your decision — "
+            "nothing was done with them. They remain in the source folder.[/bold yellow]"
+        )
+        # Counts alone are not actionable: you cannot decide about a file you
+        # cannot name. List every REVIEW file, secrets first.
+        secrets = [p for p, c in review if c in policy.never_export]
+        others = [p for p, c in review if c not in policy.never_export]
+
+        if secrets:
+            console.print(
+                "\n[red]Credential-bearing — never exported. Rotate or destroy "
+                "rather than taking copies:[/red]"
+            )
+            for p in sorted(secrets):
+                console.print(f"    [red]{Path(p).name}[/red]")
+
+        if others:
+            console.print(
+                f"\n[yellow]Unclassified ({len(others)}) — the classifier had no "
+                "confident answer. Check these by hand:[/yellow]"
+            )
+            for p in sorted(others):
+                console.print(f"    {Path(p).name}")
+
+
+def _write_manifest(
+    plan: dict[str, Classification],
+    policy: RetentionPolicy,
+    destination: Path,
+    manifest: str | None,
+    apply: bool,
+) -> Path | None:
+    """Write a full audit trail of every file and what happened to it.
+
+    Offboarding is exactly the situation where you may later need to show
+    what you took and what you left, so the manifest covers all three
+    dispositions rather than only the exported set.
+    """
+    if manifest:
+        path = Path(manifest).expanduser().resolve()
+    elif apply:
+        path = destination / "manifest.csv"
+    else:
+        return None
+
+    rows = []
+    for filepath, c in plan.items():
+        disp = policy.disposition(c.category)
+        exported = disp is Disposition.KEEP and policy.is_exportable(c.category)
+        rows.append({
+            "disposition": disp.value,
+            "exported": "yes" if (exported and apply) else "no",
+            "category": c.category,
+            "confidence": c.confidence,
+            "method": c.method,
+            "filename": Path(filepath).name,
+            "source_path": filepath,
+            "reason": c.reason,
+        })
+    rows.sort(key=lambda r: (r["disposition"], r["category"], r["filename"]))
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["disposition"])
+            writer.writeheader()
+            writer.writerows(rows)
+    except OSError as e:
+        console.print(f"[red]Could not write manifest:[/red] {e}")
+        return None
+    return path
+
+
+def _print_policy(policy: RetentionPolicy) -> None:
+    table = Table(title="Offboarding retention policy")
+    table.add_column("Disposition", style="bold")
+    table.add_column("Categories")
+    styles = {Disposition.KEEP: "green", Disposition.LEAVE: "red", Disposition.REVIEW: "yellow"}
+    for disp in Disposition:
+        cats = sorted(c for c, d in policy.by_category.items() if d is disp)
+        table.add_row(f"[{styles[disp]}]{disp.value.upper()}[/{styles[disp]}]", "\n".join(cats))
+    console.print(table)
+    if policy.never_export:
+        console.print(
+            "[red]Never exported under any flag:[/red] " + ", ".join(sorted(policy.never_export))
+        )
+
+
+def _print_disposition(buckets: dict, policy: RetentionPolicy) -> None:
+    styles = {Disposition.KEEP: "green", Disposition.LEAVE: "red", Disposition.REVIEW: "yellow"}
+    blurb = {
+        Disposition.KEEP: "your records — exported",
+        Disposition.LEAVE: "company / customer property — left behind",
+        Disposition.REVIEW: "needs your decision — untouched",
+    }
+    for disp in Disposition:
+        entries = buckets[disp]
+        colour = styles[disp]
+        console.print(
+            f"\n[bold {colour}]{disp.value.upper()}[/bold {colour}] "
+            f"({len(entries)} files — {blurb[disp]})"
+        )
+        by_cat: dict[str, int] = {}
+        for _, cat in entries:
+            by_cat[cat] = by_cat.get(cat, 0) + 1
+        for cat, n in sorted(by_cat.items(), key=lambda x: -x[1]):
+            flag = "  [red](never exported)[/red]" if cat in policy.never_export else ""
+            console.print(f"    {cat}: {n}{flag}")
+
+
 @app.command(name="check-rules")
 def check_rules():
     """Validate categories.yaml and print a summary of registered rules."""
@@ -608,13 +834,25 @@ def _model_for_route(config: dict, route: str, override: str | None = None) -> s
 def _build_worker_classifier(route: str, config: dict, model_override: str | None):
     """Pick the right classifier for a given queue route.
 
-    Pipeline order is **AI first**, rules as a fallback. The previous
-    order (HC-rules → AI → rules) meant every file with a familiar
-    keyword in its name short-circuited the LLM, so the AI fleet was
-    expensive plumbing that almost never ran. Now the LLM gets to weigh
-    in on every file the dispatcher hands it; rules only catch the
-    cases where the LLM declines (no extractable text, output not in
-    the allowed category set, confidence below threshold).
+    Order is **HC-rules → AI → keyword-rules**, which splits the difference
+    between the two previous designs.
+
+    Going fully rules-first starved the LLM: any file with a familiar
+    keyword short-circuited it, so the AI fleet was expensive plumbing that
+    rarely ran. But going fully AI-first put the LLM ahead of markers that
+    are true *by definition*, and it lost to them. Observed in one run: the
+    sector-ETF exports split across two categories because the model reads
+    ``Date,Open,High,Low,Close,Volume`` as generic finance — xlc/xle landed
+    in AstroQuant while xlb/xlf/xlp/xlu landed in Financial_Taxes. Same for
+    ``PATEL_CAN_PAY_SLIP_*``, where the model contradicted the project's own
+    pay-slip rule.
+
+    ``HighConfidenceRulesClassifier`` is a deliberately small, curated regex
+    list (IMM form numbers, T4, PCC, ticker filenames) — cases where a
+    filename is definitional and a 7B model second-guessing it is strictly
+    worse. It matches a small minority of files, so the LLM still sees the
+    bulk of the corpus. ``RulesClassifier`` (fuzzy keyword matching) stays
+    *behind* the AI, which is what the AI-first change was really protecting.
     """
     rules = RulesEngine(str(CONFIG_PATH))
     categories = list(config["categories"].keys())
@@ -625,8 +863,8 @@ def _build_worker_classifier(route: str, config: dict, model_override: str | Non
         ai = LocalAIClassifier(model=model)
         extractor = FileExtractor(max_chars=config["settings"]["max_extract_chars"])
         return ClassificationPipeline([
+            HighConfidenceRulesClassifier(rules),  # definitional filename markers win outright
             LocalAIPipelineClassifier(ai, extractor, categories, threshold, enabled=True),
-            HighConfidenceRulesClassifier(rules),  # safety net: unambiguous filename markers
             RulesClassifier(rules),                # last resort: keyword + extension fallback
         ])
     if route in (ROUTE_RULES, ROUTE_OCR):
